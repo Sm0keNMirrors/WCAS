@@ -1,0 +1,25 @@
+&control
+domains = #,
+start_lai_mnth = 1,
+end_lai_mnth   = 12,
+wrf_dir   = #
+megan_dir = #
+out_dir = #
+
+/
+
+&windowdefs
+
+ x0         =  1,
+ y0         =  1,
+ ncolsin    =  #,
+ nrowsin    =  #,
+
+/
+
+
+
+
+
+
+

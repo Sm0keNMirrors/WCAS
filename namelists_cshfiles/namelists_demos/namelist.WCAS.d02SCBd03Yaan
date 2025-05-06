@@ -1,0 +1,74 @@
+&dirs
+  WPS_dir = "/home/shiroko/WPS-4.1/"
+  WRF_dir = "/home/shiroko/WRF-4.1.2/"
+  CMAQ_dir = "/home/shiroko/CMAQ/CMAQv5.3/"
+  premegan_dir = "/home/shiroko/MEGAN/prepmegan4cmaq/"
+  premeganinput_dir = "/home/shiroko/MEGAN/preMEGAN_input/"
+  premeganoutput_dir = "/home/shiroko/MEGAN/preMEGAN_output/"
+  MEGAN_dir = "/home/shiroko/MEGAN/MEGAN210/"
+  MEIAT_dir = "/mnt/d/MEIAT-CMAQ-1.4/"
+  MEIAT_python_dir = "D:/anaconda3/envs/arcgispro-py3-2/python.exe"
+/
+
+&grid
+  ratio=3
+  res_d01=27000
+  std_lat1_d01=20.0
+  std_lat2_d01=40.0
+
+  lat_min_d01=26.12
+  lat_max_d01=35.21
+  lon_min_d01=97.80
+  lon_max_d01=110.67
+
+  lat_min_d02=27.16
+  lat_max_d02=33.02
+  lon_min_d02=101.1
+  lon_max_d02=108.5
+
+  lat_min_d03=28.2
+  lat_max_d03=32.09
+  lon_min_d03=101.3
+  lon_max_d03=105
+/
+
+&date
+  start_date = "2022-12-23"
+  end_date = "2023-01-17"
+/
+
+&control
+  cores_win = 16
+  cores_WRF = 6
+  cores_CMAQ_col = 4
+  cores_CMAQ_row = 4
+  GridName = "Yaan202301"
+  CMAQsimtype = 'regrid'
+  regrid_dom = 2
+  max_dom = 3
+
+  MannualExtent = .false.
+  Extent = 101.53522, 104.9686, 28.636894, 31.074623
+  
+  testGeogrid = .false.
+  dom_now_wind = .true.
+  ManualGrid = .false.
+  runCMAQ = .false.
+  runMEGAN = .false.
+  runISAM = .false.
+  runPostprocess = .true.
+/
+
+&manualgrid
+ i_parent_start    = 1,11,22,
+ j_parent_start    = 1,6,20,
+ e_we          = 43,67,55
+ e_sn          = 36,76,91
+ dx = 27000,
+ dy = 27000,
+ ref_lat   =  35.00,
+ ref_lon   =  102.9,
+ truelat1  =  20.0,
+ truelat2  =  40.0,
+ stand_lon =  104.41,
+/

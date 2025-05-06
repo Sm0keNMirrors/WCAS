@@ -1,0 +1,29 @@
+&global
+    griddesc_file = "input\GRIDDESC"
+    griddesc_name = #
+    big_grid_file = "shapefile\CN-City.shp"
+    geotiff_dir = "D:\MEIAT-CMAQ-1.4\data\G-MEIC_CB05_2020"
+    inventory_label = "MEIC"
+    inventory_year = "2020"
+    sectors = 'transportation', 'residential', 'power', 'agriculture', 'industry'
+    allocator = 'trafic_percent.tif', 'landscan-global-2018_nodata.tif', 'power.tif', 'agriculture.tif', 'industry_percent_IDLver.tif',
+    allocator_type = "raster", "raster", "raster", "raster", "raster"
+    inventory_mechanism = "MEIC-CB05"
+    target_mechanism = "CB06"
+    start_date = #
+    end_date = #
+    cores = #
+ /
+
+ &line
+    line_files = "motorway.shp", "primary.shp", "residential.shp", "secondary.shp"
+    line_factors = 0.435798, 0.326848, 0.081712, 0.155642,
+ /
+
+ &control
+    create_grid = 1,
+    grid_info = 1,
+    create_factor = 1,
+    coarse_emission = 1,
+    create_source = 1,
+ /

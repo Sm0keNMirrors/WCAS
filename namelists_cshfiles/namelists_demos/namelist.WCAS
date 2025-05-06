@@ -1,0 +1,101 @@
+&dirs
+  WPS_dir = "/home/shiroko/WPS-4.1/"
+  WRF_dir = "/home/shiroko/WRF-4.5.1/"
+  CMAQ_dir = "/home/shiroko/CMAQ/CMAQv5.3/"
+  premegan_dir = "/home/shiroko/MEGAN/prepmegan4cmaq/"
+  premeganinput_dir = "/home/shiroko/MEGAN/preMEGAN_input/"
+  premeganoutput_dir = "/home/shiroko/MEGAN/preMEGAN_output/"
+  MEGAN_dir = "/home/shiroko/MEGAN/MEGAN210/"
+  MEIAT_dir = "/mnt/d/MEIAT-CMAQ-1.4/"
+  MEIAT_python_dir = "D:/anaconda3/envs/arcgispro-py3-2/python.exe"
+/
+
+&grid
+  ratio=3
+  res_d01=9000
+  std_lat1_d01=20.0
+  std_lat2_d01=40.0
+
+  lat_min_d01=27.38
+  lat_max_d01=31.44
+  lon_min_d01=101.29
+  lon_max_d01=106.18
+
+  lat_min_d02=27.93
+  lat_max_d02=30.69
+  lon_min_d02=102.21
+  lon_max_d02=104.69
+
+  lat_min_d03=28.92
+  lat_max_d03=30.02
+  lon_min_d03=103.25
+  lon_max_d03=104.32
+/
+
+&date
+  start_date = "2024-09-20"
+  end_date = "2024-09-20"
+/
+
+&control
+  cores_win = 8
+  cores_WRF = 16
+  cores_CMAQ_col = 4
+  cores_CMAQ_row = 4
+  GridName = "MEIClambert_grid"
+  CMAQsimtype = 'regrid'
+  regrid_dom = 2
+  regrid_D02andD03 = .false.
+  CCTMversion = '532'
+  BCICversion = '532'
+  compiler_str = 'gcc'
+
+  aria2c_download = .false.
+  remote_server_download = .false.
+  remoteServer_hostname = '94.74.121.127'
+  remoteServer_port = 1120
+  remoteServer_username = 'root'
+  remoteServer_password = 'Nh07#KpdO@Z@hGiW'
+  ForceGFS = .False.
+
+
+  MannualExtent = .false.
+  Extent = 106.58, 108.62, 30.28, 32.38
+  
+  testGeogrid = .true.
+  
+  dom_now_wind = .false.
+  ManualGrid = .true.
+
+  runCMAQ = .true.
+  runMEGAN = .false.
+  runISAM = .false.
+  runPostprocess = .true.
+  CMAQcombine = .false.
+
+  Mannualterminal = .false.
+  control_terminal = "/dev/pts/0"
+  
+  MEIAT_Linux = .false.
+  MEIAT_Linux_dir = ""
+/
+
+&manualgrid
+ max_dom = 2
+ i_parent_start       = 1, 6
+ j_parent_start       = 1, 8
+ e_we                 = 77, 175
+ e_sn                 = 58, 130
+ dx                   = 108000
+ dy                   = 108000
+ ref_lat              = 34
+ ref_lon              = 110
+ truelat1             = 25
+ truelat2             = 40
+ stand_lon            = 110
+/
+
+&ISAMcontrol
+  mask_shpfilenames = 'dazhou'
+  mask_varnames = 'DZ',
+/
