@@ -99,6 +99,8 @@ https://drive.google.com/file/d/1dxAfXq-O064GfZ8TE2EhK2Zq4Ew4sE2-/view?usp=drive
   compiler_str = 'gcc' # 编译器str
   max_dom = 3 # 最大模拟嵌套数
   
+  direct_linkreanalysis = .true. # 是否直接link再分析资料而不是自动下载，用于弱网络环境
+  direct_linkreanalysis_dir = '' # 用于直接link再分析资料的资料存放目录
   aria2c_download = .false. # 是否使用aria2c来下载再分析资料，前提下载环境需安装aria2c
   remote_server_download = .false. # 是否使用远程服务器下载再分析资料
   remoteServer_hostname = 'xx.xx.xxx.xxx' # 远程服务器地址

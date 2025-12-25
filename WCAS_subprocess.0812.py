@@ -930,25 +930,6 @@ def check_process_status(process_name):
     except subprocess.CalledProcessError:
         # 命令执行失败
         return False
-def check_squeue_status(process_name):
-    """
-    检查
-    """
-    try:
-        # 执行 squeue 命令并获取输出
-        result = subprocess.check_output(['squeue'], text=True)
-        # 按行分割 squeue 输出
-        lines = result.splitlines()
-        # 遍历每行，检查是否同时包含 'wrf' 和 'xianyaohan'
-        for line in lines:
-            if f'{process_name}' in line and 'xianyaohan' in line:
-                return True
-        # 如果没有找到符合条件的行，返回 False
-        return False
-    except subprocess.CalledProcessError as e:
-        # 如果 squeue 命令失败，打印错误并返回 False
-        print(f"Error executing squeue: {e}")
-        return False
 def modify_csh_variable(file_path, variable_name, new_value):
     # 读取原始文件内容
     with open(file_path, 'r') as file:
@@ -1282,10 +1263,6 @@ class WCAS_init():
             self.remoteServer_password = self.namelist_WCAS['control']['remoteServer_password']
         self.ForceGFS = self.namelist_WCAS['control']['ForceGFS']
 
-        self.ScNet_env = self.namelist_WCAS['control']['ScNet_env']
-        if self.ScNet_env == True:
-            self.WPS_WRF_env = self.namelist_WCAS['ScNetcontrol']['WPS_WRF_env']
-
         self.MannualExtent = self.namelist_WCAS['control']['MannualExtent']
         self.Extent = self.namelist_WCAS['control']['Extent']
         self.testGeogrid = self.namelist_WCAS['control']['testGeogrid']
@@ -1311,7 +1288,6 @@ class WCAS_init():
         else:
             self.mask_varnames_l = []
             self.mask_varnames_l.append(self.mask_varnames)
-        os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/flagfiles') # flags文件夹，如果中途终端，可跳过已经模拟完成的长时间过程(WRF,MEIAT,CCTM)
 class WCAS_datetimeInit():
 
     def __init__(self,WCAS_init):
@@ -1446,21 +1422,17 @@ class WCAS_GetReanalysis():
                     self.GFS = 1
                 else: self.GFS = 0
             print(Now() + ' - 此次模拟的FNL/GFS再分析资料已经下载')
-        
+        execute_command(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/flagfiles') # flags文件夹，如果中途终端，可跳过已经模拟完成的长时间过程(WRF,MEIAT,CCTM)
     
     def Getlink(self):
         print(Now() + ' - 整理已有下载FNL/GFS再分析资料')
         if not os.path.exists(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles/'):
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}')
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
-
             fnl_filelist = downLoadFNLfiles(self.start_date_WRF, self.end_date_WRF,only_get_filelist=True)
-            for url in tqdm(fnl_filelist):
-                f = url.split('/')[-1]
-                execute_command(f'cp {self.direct_linkreanalysis_dir}{f} {self.WCAS_dir}simulations/{self.gridname}/fnlfiles/') # 复制转移
-            print(Now() + ' - 此次模拟的FNL/GFS再分析资料整理完成')
+            for f in fnl_filelist:
+                execute_command(f'cp {self.direct_linkreanalysis_dir}f {self.WCAS_dir}simulations/{self.gridname}/fnlfiles/') # 复制转移
         else:
             print(Now() + ' - 此次模拟的FNL/GFS再分析资料已经整理')
+
 class WCAS_CalcuWRFGrid():
 
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_GetReanalysis):
@@ -1470,15 +1442,11 @@ class WCAS_CalcuWRFGrid():
         self.gridname = WCAS_init.gridname
         self.max_dom_manual = WCAS_init.max_dom_manual
         self.WPS_dir = WCAS_init.WPS_dir
-        self.ScNet_env = WCAS_init.ScNet_env
 
         self.start_date_WRF = WCAS_datetimeInit.start_date_WRF
         self.end_date_WRF = WCAS_datetimeInit.end_date_WRF
 
-        if WCAS_init.direct_linkreanalysis == False:
-            self.GFS = WCAS_GetReanalysis.GFS
-        else:
-            self.GFS = 0
+        self.GFS = WCAS_GetReanalysis.GFS
 
     def reload_namelist(self): # 在testgeogrid过程再次读取namelist
         self.namelist_WCAS = f90nml.read(f"{self.WCAS_dir}namelist.WCAS") # 再次读取
@@ -1512,8 +1480,6 @@ class WCAS_CalcuWRFGrid():
             grid_dict.update({'truelat2': self.namelist_WCAS['manualgrid']['truelat2']})
             grid_dict.update({'stand_lon': self.namelist_WCAS['manualgrid']['stand_lon']})
             self.resd01 = self.namelist_WCAS['manualgrid']['dx']
-            self.resd02 = self.resd01 /3
-            self.resd03 = self.resd01 /3 /3
         with open(f'{self.WCAS_dir}simulations/{self.gridname}/geogridinfo.txt', 'w') as file:
             print(grid_dict, file=file)
         print(Now() + ' - wrf_lambert_grid_caculating计算完成')    
@@ -1564,7 +1530,9 @@ class WCAS_CalcuWRFGrid():
         namelist_wps['geogrid']['dx'] = self.resd01
         namelist_wps['geogrid']['dy'] = self.resd01
 
-        
+        self.resd01 = self.namelist_WCAS['grid']['res_d01']
+        self.resd02 = self.resd01 /3
+        self.resd03 = self.resd01 /3 /3
 
         if self.GFS == 1: namelist_wps['share']['interval_seconds'] = 10800
         else: namelist_wps['share']['interval_seconds'] = 21600
@@ -1580,13 +1548,10 @@ class WCAS_RunWPS():
         self.WPS_dir = WCAS_init.WPS_dir
         self.WRF_dir = WCAS_init.WRF_dir
         self.testGeogrid = WCAS_init.testGeogrid
-        self.ScNet_env = WCAS_init.ScNet_env
-
-        if self.ScNet_env == True:
-            self.WPS_WRF_env = WCAS_init.WPS_WRF_env
 
     def run(self):
         print(Now() + ' - 开始运行WPS')
+        # ========================================WPS======================================== 注释此部分可跳过,用于调试
         if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok") == False:
             print(Now() + ' - 删除WPS与WRF的历史临时文件...')
             # terminal_exec(terminal, f"cd {WPS_dir}")
@@ -1646,6 +1611,7 @@ class WCAS_RunWPS():
             print(Now() + ' - ' + '    开始运行metgrid.exe...')
             execute_command("./metgrid/metgrid.exe")
             print(Now() + ' - ' + '    metgrid.exe运行完成')
+        # ========================================WPS======================================== 注释此部分可跳过,用于调试
 
         print(Now() + ' - ' + 'WPS运行完成')
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok")
@@ -1665,10 +1631,8 @@ class WCAS_RunWRF():
         self.start_date_WRF = WCAS_datetimeInit.start_date_WRF
         self.end_date_WRF = WCAS_datetimeInit.end_date_WRF
         self.run_days_WRF = WCAS_datetimeInit.run_days_WRF
-        if WCAS_init.direct_linkreanalysis == False:
-            self.GFS = WCAS_GetReanalysis.GFS
-        else:
-            self.GFS = 0
+
+        self.GFS = WCAS_GetReanalysis.GFS
 
         self.e_we_1 = WCAS_CalcuWRFGrid.e_we_1
         self.e_sn_1 = WCAS_CalcuWRFGrid.e_sn_1
@@ -1681,10 +1645,6 @@ class WCAS_RunWRF():
         self.i_parent_start_3 = WCAS_CalcuWRFGrid.i_parent_start_3
         self.j_parent_start_3 = WCAS_CalcuWRFGrid.j_parent_start_3
         self.resd01 = WCAS_CalcuWRFGrid.resd01
-
-        self.ScNet_env = WCAS_init.ScNet_env
-        if self.ScNet_env == True:
-            self.WPS_WRF_env = WCAS_init.WPS_WRF_env
 
     def run(self):
         print(Now() + ' - '+'将模拟时间段和嵌套范围数据写入namelist.input')
@@ -1737,16 +1697,7 @@ class WCAS_RunWRF():
         
         if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok") == False:
             execute_command("./real.exe")
-            if self.ScNet_env == True: # 曙光服务器环境sbatch提交运行
-                self.modify_ntasks_per_node('wrf.slurm',self.cores_WRF)
-                execute_command(F"sbatch wrf.slurm")
-                time.sleep(10) # 提交等待过程
-                while True:
-                    time.sleep(1)
-                    if not check_squeue_status('wrf'):  # 检查进程是否结束
-                        break
-            else: # 一般环境直接mpi运行
-                execute_command(F"mpiexec -n {self.cores_WRF} ./wrf.exe ")
+            execute_command(F"mpiexec -n {self.cores_WRF} ./wrf.exe ")
             execute_command("mkdir WRFoutput")
             execute_command("mv wrfi* wrfo* wrfr* wrfbdy* WRFoutput")
             if os.path.exists(f"{self.WRF_dir}run/WRFoutput/wrfout_d01_{self.end_date_WRF.split('-')[0]}-{self.end_date_WRF.split('-')[1]}-{self.end_date_WRF.split('-')[2]}_00:00:00") == False:
@@ -1756,40 +1707,6 @@ class WCAS_RunWRF():
         # ========================================WRF======================================== 注释此部分可跳过,用于调试
         print(Now() + ' - '+'WRF运行完成！')
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok")
-        
-    def modify_ntasks_per_node(self,filename, new_value, output_filename=None):
-        """
-        修改文件中 `#SBATCH --ntasks-per-node=` 的值。
-        
-        参数：
-        - filename: str, 要修改的文件名（如 wrf.slurm）。
-        - new_value: int, 替换 `#SBATCH --ntasks-per-node=` 的新值。
-        - output_filename: str, 修改后的文件保存路径。如果为 None，则覆盖原文件。
-        """
-        try:
-            # 打开文件并读取所有行
-            with open(filename, 'r') as file:
-                lines = file.readlines()
-            
-            # 遍历每一行，找到需要修改的行并替换
-            for i, line in enumerate(lines):
-                if line.startswith("#SBATCH --ntasks-per-node="):
-                    # 修改该行，替换数字部分
-                    lines[i] = f"#SBATCH --ntasks-per-node={new_value}\n"
-                    break
-            
-            # 如果没有提供输出文件名，覆盖原文件
-            if output_filename is None:
-                output_filename = filename
-            
-            # 将修改后的内容写回文件
-            with open(output_filename, 'w') as file:
-                file.writelines(lines)
-            
-            # print(f"文件修改成功，已保存到: {output_filename}")
-        
-        except Exception as e:
-            print(f"修改文件时出错: {e}")
 class WCAS_RunMCIP():
     
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid):
@@ -1810,7 +1727,7 @@ class WCAS_RunMCIP():
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
 
     def run(self,regrid_dom):
-        self.regrid_dom = regrid_dom # profile从d01开始，也可能直接profile目标dom
+        self.regrid_dom = regrid_dom # profile从d01开始
         print(Now() + ' - ' + f'开始准备CMAQ的模拟 - 模拟方式 - {self.CMAQsimtype}')
         print(Now() + ' - ' +f'    开始运行MCIP - d{self.regrid_dom}')
         self.MCIP_GridName = self.gridname + '_d0'+str(self.regrid_dom)
@@ -1856,7 +1773,7 @@ class WCAS_RunBCON():
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
 
     def run_profile(self):
-        print(Now() + ' - ' +f'    开始运行BCON - d0{str(self.regrid_dom)}')
+        print(Now() + ' - ' +f'    开始运行BCON - d0{1}')
         os.chdir(f"{self.WCAS_dir}")
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','BCTYPE','profile')
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','start_time',self.start_date_MCIP)
@@ -1914,7 +1831,7 @@ class WCAS_RunICON():
         self.MCIP_GridName_d01 = self.gridname + '_d01' # D01是必要的结果
 
     def run_profile(self):
-        print(Now() + ' - ' +f'    开始运行ICON - d0{str(self.regrid_dom)}')
+        print(Now() + ' - ' +f'    开始运行ICON - d0{1}')
         os.chdir(f"{self.WCAS_dir}")
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','APPL',self.ICON_APPL)
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','ICTYPE','profile')
@@ -2063,8 +1980,8 @@ class WCAS_RunMEIAT():
         if self.regrid_dom == 2: self.domres = self.resd02
         if self.regrid_dom == 3: self.domres = self.resd03
 
-        self.ScNet_env = WCAS_init.ScNet_env
-    
+        
+
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
 
       
@@ -2117,15 +2034,7 @@ class WCAS_RunMEIAT():
             namelist_MEIAT_Linux.write(f"{self.MEIAT_Linux_dir}namelist.input", force=True)
             os.chdir( f"{self.MEIAT_Linux_dir}") # 进入MEIAT并执行排放清单计算
             if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEIAT_d0{targetdom}.ok") == False:
-                if self.ScNet_env == True: # 曙光服务器环境采用slrum方式提交运行
-                    execute_command(F"sbatch MEIAT.slurm")
-                    time.sleep(10) # 提交等待过程
-                    while True:
-                        time.sleep(1)
-                        if not check_squeue_status('MEIAT-CMAQ'):  # 检查提交的任务是否结束
-                            break
-                else:
-                    execute_command( f"python3 meicmix_f2c.py") 
+                execute_command( f"python3 meicmix_f2c.py") 
                 execute_command(f"mv {self.MEIAT_Linux_dir}model_emission_{self.MCIP_GridName}/*_*_{self.MCIP_GridName}_*.nc {self.CMAQdata_dir}{self.MCIP_GridName}/emis/") # 移动生成的人为源排放清单
                 time.sleep(5) # 移动，复制等操作后需要等待时间，否则会在未完成复制移动后进行检测
             print(Now() + ' - ' +'    人为源排放清单生成完成')
@@ -2377,9 +2286,9 @@ if __name__ == "__main__":
     WCAS_RunWRF = WCAS_RunWRF(WCAS_init,WCAS_datetimeInit,WCAS_GetReanalysis,WCAS_CalcuWRFGrid) # 生成namelist.input并进行WRF的运行
     WCAS_RunWRF.run()
     if WCAS_init.runCMAQ: 
-        if WCAS_init.CMAQsimtype == 'profile': # 直接以profile的方式对regriddom进行模拟
+        if WCAS_init.CMAQsimtype == 'profile':
             WCAS_RunMCIP = WCAS_RunMCIP(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid)
-            WCAS_RunMCIP.run(regrid_dom=WCAS_init.regrid_dom)
+            WCAS_RunMCIP.run(regrid_dom=1)
             WCAS_RunBCON = WCAS_RunBCON(WCAS_init,WCAS_datetimeInit,WCAS_RunMCIP)
             WCAS_RunBCON.run_profile()
             WCAS_RunICON = WCAS_RunICON(WCAS_init,WCAS_datetimeInit,WCAS_RunMCIP)
@@ -2393,7 +2302,6 @@ if __name__ == "__main__":
             WCAS_RunMEIAT.run(targetdom=WCAS_init.regrid_dom)
             WCAS_RunCCTM = WCAS_RunCCTM(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP)
             WCAS_RunCCTM.run_profile()
-            sys.exit()
             WCAS_RunCombine = WCAS_RunCombine(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP)
             WCAS_RunCombine.run_profile()
             WCAS_RunCombine.move_WRFoutput()

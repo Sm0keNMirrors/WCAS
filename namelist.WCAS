@@ -51,6 +51,10 @@
   compiler_str = 'gcc'
   max_dom = 3
 
+  ScNet_env = .False.
+
+  direct_linkreanalysis = .true.
+  direct_linkreanalysis_dir = ''
   aria2c_download = .false.
   remote_server_download = .false.
   remoteServer_hostname = '94.74.121.127'
@@ -74,11 +78,13 @@
   runPostprocess = .true.
   CMAQcombine = .false.
 
-  Mannualterminal = .false.
+  Mannualterminal = .true.
   control_terminal = "/dev/pts/0"
   
   MEIAT_Linux = .true.
   MEIAT_Linux_dir = "/mnt/d/MEIAT-CMAQ-Linux-4.0/MEIAT-CMAQ-Linux-4.0/"
+
+  
 /
 
 &manualgrid
@@ -99,4 +105,8 @@ i_parent_start = 1, 22, 81
   if_makemask = .true.
   mask_shpfilenames = 'chengdu'
   mask_varnames = 'CD',
+/
+
+&ScNetcontrol
+  WPS_WRF_env = '/work/home/xianyaohan/apprepo/wrf_wps/4.5-intelmpi2017/scripts/env.sh'
 /
