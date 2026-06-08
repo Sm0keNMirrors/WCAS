@@ -884,12 +884,18 @@ def O3PM25Combine_CMAQfiles(
     data_id[:] = PM25_data
 
 #模型参数修改计算及流程控制
-def execute_command(cmd: str):
+def execute_command(cmd: str, check=True):
     """执行指令并将stdout输出到WCAS.log文件"""
     result = subprocess.run(cmd, shell=True, executable='/bin/bash', capture_output=True, text=True)
     with open(WCAS_init.WCAS_logfile, 'a', encoding='utf-8') as file:
         file.write(result.stdout + '\n')  # 写入信息并换行
-    # return result
+    if result.stderr:
+        with open(WCAS_init.WCAS_logfile, 'a', encoding='utf-8') as file:
+            file.write(result.stderr + '\n')
+    mkdir_file_exists = cmd.strip().startswith("mkdir ") and result.returncode != 0 and "File exists" in result.stderr
+    if check and result.returncode != 0 and not mkdir_file_exists:
+        raise RuntimeError(f"Command failed ({result.returncode}): {cmd}\n{result.stderr}")
+    return result
 def get_unused_ttys(maxtty=15): # 返回未被使用的tty，顺序排列，然后就可以找到cmd打开的wsl新终端号，即第一个，maxtty指当前可能运行的最大终端数
     # 运行ps aux命令
     result = subprocess.run(['ps', 'aux'], stdout=subprocess.PIPE, text=True)
@@ -949,6 +955,91 @@ def check_squeue_status(process_name):
         # 如果 squeue 命令失败，打印错误并返回 False
         print(f"Error executing squeue: {e}")
         return False
+
+def check_squeue_job_status(job_id):
+    try:
+        result = subprocess.check_output(['squeue', '-j', str(job_id), '-h'], text=True)
+        return result.strip() != ''
+    except subprocess.CalledProcessError:
+        return False
+
+def run_sbatch_and_wait(script_name, done_file=None, poll_seconds=30):
+    if done_file and os.path.exists(done_file):
+        os.remove(done_file)
+    result = execute_command(f"sbatch {script_name}")
+    match = re.search(r"Submitted batch job\s+(\d+)", result.stdout)
+    if match:
+        job_id = match.group(1)
+        time.sleep(5)
+        while check_squeue_job_status(job_id):
+            time.sleep(poll_seconds)
+    elif done_file:
+        while not os.path.exists(done_file):
+            time.sleep(poll_seconds)
+    if done_file and not os.path.exists(done_file):
+        raise RuntimeError(f"Slurm job finished but done flag was not created: {done_file}")
+    return result
+
+def ensure_min_files(dir_path, min_count, process_name, prefix=None):
+    if not os.path.exists(dir_path):
+        raise RuntimeError(f"{process_name} output directory does not exist: {dir_path}")
+    files = os.listdir(dir_path)
+    if prefix is not None:
+        files = [f for f in files if f.startswith(prefix)]
+    if len(files) < min_count:
+        raise RuntimeError(f"{process_name} output check failed: {dir_path}, expected >= {min_count}, got {len(files)}")
+    return files
+
+def scalar_nml(value, name):
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            raise ValueError(f"{name} is empty")
+        value = value[0]
+    return value
+
+def scalar_number_nml(value, name):
+    value = scalar_nml(value, name)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, str):
+        value = value.strip()
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric, got {type(value).__name__}: {value}")
+    return value
+
+def nml_list(value, name):
+    if value is None:
+        raise ValueError(f"{name} is missing")
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def ensure_simulation_dirs(WCAS_dir, gridname):
+    simulation_dir = ensure_dir(f"{WCAS_dir}simulations/{gridname}")
+    flag_dir = ensure_dir(f"{simulation_dir}/flagfiles")
+    return simulation_dir, flag_dir
+
+def build_lon_lat_limit(namelist_WCAS, max_dom):
+    lon_lat_limit = {}
+    for dom_i in range(1, max_dom + 1):
+        dom = f'd{dom_i:02}'
+        lon_lat_limit[dom] = [
+            [namelist_WCAS['grid'][f'lat_min_{dom}'], namelist_WCAS['grid'][f'lat_max_{dom}']],
+            [namelist_WCAS['grid'][f'lon_min_{dom}'], namelist_WCAS['grid'][f'lon_max_{dom}']]
+        ]
+    return lon_lat_limit
+
 def modify_csh_variable(file_path, variable_name, new_value):
     # 读取原始文件内容
     with open(file_path, 'r') as file:
@@ -1264,9 +1355,15 @@ class WCAS_init():
         self.cores_CMAQ_row = self.namelist_WCAS['control']['cores_CMAQ_row']
         self.gridname = self.namelist_WCAS['control']['Gridname']
         self.CMAQsimtype = self.namelist_WCAS['control']['CMAQsimtype']
-        self.regrid_dom = self.namelist_WCAS['control']['regrid_dom']
+        self.regrid_dom = int(scalar_number_nml(self.namelist_WCAS['control']['regrid_dom'], 'control.regrid_dom'))
         self.regrid_D02andD03 = self.namelist_WCAS['control']['regrid_D02andD03']
-        self.max_dom_manual = self.namelist_WCAS['control']['max_dom']
+        self.max_dom_manual = int(scalar_number_nml(self.namelist_WCAS['control']['max_dom'], 'control.max_dom'))
+        if self.max_dom_manual < 1 or self.max_dom_manual > 3:
+            raise ValueError(f"control.max_dom must be 1, 2, or 3; got {self.max_dom_manual}")
+        if self.regrid_dom < 1 or self.regrid_dom > self.max_dom_manual:
+            raise ValueError(f"control.regrid_dom={self.regrid_dom} exceeds max_dom={self.max_dom_manual}")
+        if self.regrid_D02andD03 == True and self.max_dom_manual < 2:
+            raise ValueError("regrid_D02andD03 requires max_dom >= 2")
         self.CCTMversion = self.namelist_WCAS['control']['CCTMversion']
         self.BCICversion = self.namelist_WCAS['control']['BCICversion']
         self.compiler_str = self.namelist_WCAS['control']['compiler_str']
@@ -1311,7 +1408,7 @@ class WCAS_init():
         else:
             self.mask_varnames_l = []
             self.mask_varnames_l.append(self.mask_varnames)
-        os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/flagfiles') # flags文件夹，如果中途终端，可跳过已经模拟完成的长时间过程(WRF,MEIAT,CCTM)
+        self.simulation_dir, self.flag_dir = ensure_simulation_dirs(self.WCAS_dir, self.gridname)
 class WCAS_datetimeInit():
 
     def __init__(self,WCAS_init):
@@ -1416,8 +1513,8 @@ class WCAS_GetReanalysis():
 
                     print(Now() + ' - GFS预报场资料下载完成')
 
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}')
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
+            ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}')
+            ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
             os.system(f'mv {self.WCAS_dir}fnl* {self.WCAS_dir}simulations/{self.gridname}/fnlfiles/')
             time.sleep(1.5)
             if self.GFS == 1:
@@ -1451,8 +1548,8 @@ class WCAS_GetReanalysis():
     def Getlink(self):
         print(Now() + ' - 整理已有下载FNL/GFS再分析资料')
         if not os.path.exists(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles/'):
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}')
-            os.system(f'mkdir {self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
+            ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}')
+            ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
 
             fnl_filelist = downLoadFNLfiles(self.start_date_WRF, self.end_date_WRF,only_get_filelist=True)
             for url in tqdm(fnl_filelist):
@@ -1486,32 +1583,28 @@ class WCAS_CalcuWRFGrid():
     def run(self):
         print(Now() + ' - 计算嵌套区域数据')
         if self.ManualGrid == False: # 基于经纬度计算grid模式：
-            grid_dict = wrf_grid_calculate(lon_lat_limit={'d01': [[self.namelist_WCAS['grid']['lat_min_d01'], self.namelist_WCAS['grid']['lat_max_d01']],
-                                                [self.namelist_WCAS['grid']['lon_min_d01'], self.namelist_WCAS['grid']['lon_max_d01']]],
-                                        'd02': [[self.namelist_WCAS['grid']['lat_min_d02'], self.namelist_WCAS['grid']['lat_max_d02']],
-                                                [self.namelist_WCAS['grid']['lon_min_d02'], self.namelist_WCAS['grid']['lon_max_d02']]],  #
-                                        'd03': [[self.namelist_WCAS['grid']['lat_min_d03'], self.namelist_WCAS['grid']['lat_max_d03']],
-                                                [self.namelist_WCAS['grid']['lon_min_d03'], self.namelist_WCAS['grid']['lon_max_d03']]]},
-                                        res_d01=self.namelist_WCAS['grid']['res_d01'],
-                                        true_lat1 = self.namelist_WCAS['grid']['std_lat1_d01'],
-                                        true_lat2 = self.namelist_WCAS['grid']['std_lat2_d01']
+            res_d01 = scalar_number_nml(self.namelist_WCAS['grid']['res_d01'], 'grid.res_d01')
+            grid_dict = wrf_grid_calculate(lon_lat_limit=build_lon_lat_limit(self.namelist_WCAS, self.max_dom_manual),
+                                        res_d01=res_d01,
+                                        true_lat1 = scalar_number_nml(self.namelist_WCAS['grid']['std_lat1_d01'], 'grid.std_lat1_d01'),
+                                        true_lat2 = scalar_number_nml(self.namelist_WCAS['grid']['std_lat2_d01'], 'grid.std_lat2_d01')
                         )
-            self.resd01 = self.namelist_WCAS['grid']['res_d01']
+            self.resd01 = res_d01
             self.resd02 = self.resd01 /3
             self.resd03 = self.resd01 /3 /3
         else: # 基于grid参数的模式，主要是为了重新模拟之前已有的嵌套区域
             grid_dict = {}
             
-            grid_dict.update({'e_we':self.namelist_WCAS['manualgrid']['e_we']})
-            grid_dict.update({'e_sn':self.namelist_WCAS['manualgrid']['e_sn']})
-            grid_dict.update({'i_start': self.namelist_WCAS['manualgrid']['i_parent_start']})
-            grid_dict.update({'j_start': self.namelist_WCAS['manualgrid']['j_parent_start']})
+            grid_dict.update({'e_we':nml_list(self.namelist_WCAS['manualgrid']['e_we'], 'manualgrid.e_we')})
+            grid_dict.update({'e_sn':nml_list(self.namelist_WCAS['manualgrid']['e_sn'], 'manualgrid.e_sn')})
+            grid_dict.update({'i_start': nml_list(self.namelist_WCAS['manualgrid']['i_parent_start'], 'manualgrid.i_parent_start')})
+            grid_dict.update({'j_start': nml_list(self.namelist_WCAS['manualgrid']['j_parent_start'], 'manualgrid.j_parent_start')})
             grid_dict.update({'ref_lon': self.namelist_WCAS['manualgrid']['ref_lon']})
             grid_dict.update({'ref_lat': self.namelist_WCAS['manualgrid']['ref_lat']})
             grid_dict.update({'truelat1': self.namelist_WCAS['manualgrid']['truelat1']})
             grid_dict.update({'truelat2': self.namelist_WCAS['manualgrid']['truelat2']})
             grid_dict.update({'stand_lon': self.namelist_WCAS['manualgrid']['stand_lon']})
-            self.resd01 = self.namelist_WCAS['manualgrid']['dx']
+            self.resd01 = scalar_number_nml(self.namelist_WCAS['manualgrid']['dx'], 'manualgrid.dx')
             self.resd02 = self.resd01 /3
             self.resd03 = self.resd01 /3 /3
         with open(f'{self.WCAS_dir}simulations/{self.gridname}/geogridinfo.txt', 'w') as file:
@@ -1519,6 +1612,13 @@ class WCAS_CalcuWRFGrid():
         print(Now() + ' - wrf_lambert_grid_caculating计算完成')    
 
         print(Now() + ' - 将模拟时间段和嵌套范围数据写入namelist.wps')
+        for key in ['e_we', 'e_sn', 'i_start', 'j_start']:
+            if len(grid_dict[key]) < self.max_dom_manual:
+                raise ValueError(f"{key} has {len(grid_dict[key])} values, but max_dom is {self.max_dom_manual}")
+        self.e_we_list = grid_dict['e_we'][:self.max_dom_manual]
+        self.e_sn_list = grid_dict['e_sn'][:self.max_dom_manual]
+        self.i_parent_start_list = grid_dict['i_start'][:self.max_dom_manual]
+        self.j_parent_start_list = grid_dict['j_start'][:self.max_dom_manual]
         if self.max_dom_manual >= 2: self.i_parent_start_2 = grid_dict['i_start'][1]
         if self.max_dom_manual >= 3: self.i_parent_start_3 = grid_dict['i_start'][2]
         if self.max_dom_manual >= 2: self.j_parent_start_2 = grid_dict['j_start'][1]
@@ -1540,8 +1640,15 @@ class WCAS_CalcuWRFGrid():
         namelist_wps = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.wps.temp") #
         hour = '_00:00:00'  # 暂时未考虑非0时时段
         namelist_wps['share']['max_dom'] = self.max_dom_manual
-        namelist_wps['share']['start_date'] = [self.start_date_WRF + hour, self.start_date_WRF + hour, self.start_date_WRF + hour]
-        namelist_wps['share']['end_date'] = [self.end_date_WRF + hour, self.end_date_WRF + hour, self.end_date_WRF + hour]
+        namelist_wps['share']['start_date'] = [self.start_date_WRF + hour] * self.max_dom_manual
+        namelist_wps['share']['end_date'] = [self.end_date_WRF + hour] * self.max_dom_manual
+        if self.max_dom_manual == 1:
+            namelist_wps['geogrid']['parent_id'] = [1]
+            namelist_wps['geogrid']['parent_grid_ratio'] = [1]
+            namelist_wps['geogrid']['i_parent_start'] = [1]
+            namelist_wps['geogrid']['j_parent_start'] = [1]
+            namelist_wps['geogrid']['e_we'] = [self.e_we_1]
+            namelist_wps['geogrid']['e_sn'] = [self.e_sn_1]
         if self.max_dom_manual == 2:
             namelist_wps['geogrid']['parent_id'] = [1, 1]
             namelist_wps['geogrid']['parent_grid_ratio'] = [1, 3]
@@ -1672,14 +1779,20 @@ class WCAS_RunWRF():
 
         self.e_we_1 = WCAS_CalcuWRFGrid.e_we_1
         self.e_sn_1 = WCAS_CalcuWRFGrid.e_sn_1
-        self.e_we_2 = WCAS_CalcuWRFGrid.e_we_2
-        self.e_sn_2 = WCAS_CalcuWRFGrid.e_sn_2
-        self.i_parent_start_2 = WCAS_CalcuWRFGrid.i_parent_start_2
-        self.j_parent_start_2 = WCAS_CalcuWRFGrid.j_parent_start_2
-        self.e_we_3 = WCAS_CalcuWRFGrid.e_we_3
-        self.e_sn_3 = WCAS_CalcuWRFGrid.e_sn_3
-        self.i_parent_start_3 = WCAS_CalcuWRFGrid.i_parent_start_3
-        self.j_parent_start_3 = WCAS_CalcuWRFGrid.j_parent_start_3
+        self.e_we_list = WCAS_CalcuWRFGrid.e_we_list
+        self.e_sn_list = WCAS_CalcuWRFGrid.e_sn_list
+        self.i_parent_start_list = WCAS_CalcuWRFGrid.i_parent_start_list
+        self.j_parent_start_list = WCAS_CalcuWRFGrid.j_parent_start_list
+        if self.max_dom_manual >= 2:
+            self.e_we_2 = WCAS_CalcuWRFGrid.e_we_2
+            self.e_sn_2 = WCAS_CalcuWRFGrid.e_sn_2
+            self.i_parent_start_2 = WCAS_CalcuWRFGrid.i_parent_start_2
+            self.j_parent_start_2 = WCAS_CalcuWRFGrid.j_parent_start_2
+        if self.max_dom_manual >= 3:
+            self.e_we_3 = WCAS_CalcuWRFGrid.e_we_3
+            self.e_sn_3 = WCAS_CalcuWRFGrid.e_sn_3
+            self.i_parent_start_3 = WCAS_CalcuWRFGrid.i_parent_start_3
+            self.j_parent_start_3 = WCAS_CalcuWRFGrid.j_parent_start_3
         self.resd01 = WCAS_CalcuWRFGrid.resd01
 
         self.ScNet_env = WCAS_init.ScNet_env
@@ -1691,38 +1804,20 @@ class WCAS_RunWRF():
         namelist_input = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.input.temp")
         run_days = (datetime.datetime.strptime(self.end_date_WRF, '%Y-%m-%d') - datetime.datetime.strptime(self.start_date_WRF, '%Y-%m-%d')).days
         namelist_input['time_control']['run_days'] = self.run_days_WRF
-        if self.ManualGrid == True:
-            namelist_input['domains']['max_dom'] = self.max_dom_manual
-            namelist_input['time_control']['start_year'] = [int(self.start_date_WRF.split('-')[0])]*self.max_dom_manual
-            namelist_input['time_control']['start_month'] = [int(self.start_date_WRF.split('-')[1])]*self.max_dom_manual
-            namelist_input['time_control']['start_day'] = [int(self.start_date_WRF.split('-')[2])]*self.max_dom_manual
-            namelist_input['time_control']['end_year'] = [int(self.end_date_WRF.split('-')[0])]*self.max_dom_manual
-            namelist_input['time_control']['end_month'] = [int(self.end_date_WRF.split('-')[1])]*self.max_dom_manual
-            namelist_input['time_control']['end_day'] = [int(self.end_date_WRF.split('-')[2])]*self.max_dom_manual
-        else:
-            namelist_input['time_control']['start_year'] = [int(self.start_date_WRF.split('-')[0])]*3
-            namelist_input['time_control']['start_month'] = [int(self.start_date_WRF.split('-')[1])]*3
-            namelist_input['time_control']['start_day'] = [int(self.start_date_WRF.split('-')[2])]*3
-            namelist_input['time_control']['end_year'] = [int(self.end_date_WRF.split('-')[0])]*3
-            namelist_input['time_control']['end_month'] = [int(self.end_date_WRF.split('-')[1])]*3
-            namelist_input['time_control']['end_day'] = [int(self.end_date_WRF.split('-')[2])]*3
-        if self.max_dom_manual == 1:
-            namelist_input['domains']['e_we'] = [self.e_we_1]
-            namelist_input['domains']['e_sn'] = [self.e_sn_1]
-            namelist_input['domains']['i_parent_start'] = [1]
-            namelist_input['domains']['j_parent_start'] = [1]
-        if self.max_dom_manual == 2:
-            namelist_input['domains']['e_we'] = [self.e_we_1, self.e_we_2]
-            namelist_input['domains']['e_sn'] = [self.e_sn_1, self.e_sn_2]
-            namelist_input['domains']['i_parent_start'] = [1, self.i_parent_start_2]
-            namelist_input['domains']['j_parent_start'] = [1, self.j_parent_start_2]
-        if self.max_dom_manual == 3:
-            namelist_input['domains']['e_we'] = [self.e_we_1, self.e_we_2, self.e_we_3]
-            namelist_input['domains']['e_sn'] = [self.e_sn_1, self.e_sn_2, self.e_sn_3]
-            namelist_input['domains']['i_parent_start'] = [1, self.i_parent_start_2, self.i_parent_start_3]
-            namelist_input['domains']['j_parent_start'] = [1, self.j_parent_start_2, self.j_parent_start_3]
-        namelist_input['domains']['dx'] = [self.resd01, int(self.resd01/3), int(self.resd01/3/3)]
-        namelist_input['domains']['dy'] = [self.resd01, int(self.resd01 / 3),int(self.resd01/ 3 / 3)]
+        namelist_input['domains']['max_dom'] = self.max_dom_manual
+        namelist_input['time_control']['start_year'] = [int(self.start_date_WRF.split('-')[0])] * self.max_dom_manual
+        namelist_input['time_control']['start_month'] = [int(self.start_date_WRF.split('-')[1])] * self.max_dom_manual
+        namelist_input['time_control']['start_day'] = [int(self.start_date_WRF.split('-')[2])] * self.max_dom_manual
+        namelist_input['time_control']['end_year'] = [int(self.end_date_WRF.split('-')[0])] * self.max_dom_manual
+        namelist_input['time_control']['end_month'] = [int(self.end_date_WRF.split('-')[1])] * self.max_dom_manual
+        namelist_input['time_control']['end_day'] = [int(self.end_date_WRF.split('-')[2])] * self.max_dom_manual
+        namelist_input['domains']['e_we'] = self.e_we_list
+        namelist_input['domains']['e_sn'] = self.e_sn_list
+        namelist_input['domains']['i_parent_start'] = self.i_parent_start_list
+        namelist_input['domains']['j_parent_start'] = self.j_parent_start_list
+        dx_list = [int(self.resd01 / (3 ** dom_i)) for dom_i in range(self.max_dom_manual)]
+        namelist_input['domains']['dx'] = dx_list
+        namelist_input['domains']['dy'] = dx_list
         if self.GFS == 1: namelist_input['time_control']['interval_seconds'] = 10800
         else: namelist_input['time_control']['interval_seconds'] = 21600
         namelist_input.write(f"{self.WRF_dir}run/namelist.input", force=True)
@@ -1821,7 +1916,11 @@ class WCAS_RunMCIP():
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','domain',self.regrid_dom) # 最里层dom
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','GridName',self.MCIP_GridName)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','DataPath',self.CMAQdata_dir)
-        modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','InMetDir',f"{self.WRF_dir}run/WRFoutput")
+        wrf_output_dir = f"{self.WRF_dir}run/WRFoutput"
+        archived_wrf_output_dir = f"{self.CMAQdata_dir}WRFoutput"
+        if not os.path.exists(wrf_output_dir) and os.path.exists(archived_wrf_output_dir):
+            wrf_output_dir = archived_wrf_output_dir
+        modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','InMetDir',wrf_output_dir)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','InGeoDir',f"{self.WCAS_dir}simulations/{self.gridname}/WPSoutput")
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','WRF_LC_REF_LAT',self.ref_lat)
         os.chdir(f"{self.CMAQ_dir}PREP/mcip/scripts/") #
@@ -1840,7 +1939,7 @@ class WCAS_RunBCON():
         self.CMAQsimtype = WCAS_init.CMAQsimtype
         self.WCAS_dir = WCAS_init.WCAS_dir
         self.gridname = WCAS_init.gridname
-        self.regrid_dom = WCAS_init.regrid_dom
+        self.regrid_dom = WCAS_RunMCIP.regrid_dom
         self.CMAQ_dir = WCAS_init.CMAQ_dir
         self.WRF_dir = WCAS_init.WRF_dir
         self.compiler_str = WCAS_init.compiler_str
@@ -1858,6 +1957,7 @@ class WCAS_RunBCON():
     def run_profile(self):
         print(Now() + ' - ' +f'    开始运行BCON - d0{str(self.regrid_dom)}')
         os.chdir(f"{self.WCAS_dir}")
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_profile_d0{self.regrid_dom}.ok"
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','BCTYPE','profile')
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','start_time',self.start_date_MCIP)
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','end_time',self.end_date_MCIP)
@@ -1865,18 +1965,22 @@ class WCAS_RunBCON():
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','CMAQdata_dir',self.CMAQdata_dir)
         os.chdir(f"{self.CMAQ_dir}PREP/bcon/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh {self.CMAQ_dir}PREP/bcon/scripts/run_bcon_daybyday_profile_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_profile.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_bcon_daybyday_profile_WCAS.csh")
             if len(os.listdir(f"{self.CMAQdata_dir}{self.MCIP_GridName}/bcon")) < self.run_days_MCIP*1: # 文件生成数量是否正常
                 print(Now() + ' - '+' 错误! BCON结果未能正常输出，请检查参数输入是否正确')
                 sys.exit() 
         print(Now() + ' - ' +'    BCON运行完成！')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_profile.ok")
+        ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/bcon", self.run_days_MCIP, "BCON")
+        execute_command(f"touch {flag_file}")
 
     def run_regrid(self,targetdom,predomain=False):
         print(Now() + ' - ' +'    开始运行BCON - d0'+str(targetdom))
         os.chdir(f"{self.WCAS_dir}")
         if predomain != False: self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' # 当进行连续regrid模拟时 根据前一层的结果进行domain
+        self.regrid_dom = targetdom
+        self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
+        self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' if predomain != False else self.gridname + '_d01'
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','BCTYPE',self.CMAQsimtype) # d01
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','start_time',self.start_date_MCIP)
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','end_time',self.end_date_MCIP)
@@ -1892,6 +1996,7 @@ class WCAS_RunBCON():
             print(Now() + ' - '+' 错误! BCON结果未能正常输出，请检查参数输入是否正确')
            # sys.exit() 
         print(Now() + ' - ' +'    BCON运行完成！')
+        ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/bcon", self.run_days_MCIP, "BCON")
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_regrid_d0{targetdom}.ok")
 class WCAS_RunICON():
     
@@ -1899,7 +2004,7 @@ class WCAS_RunICON():
         self.CMAQsimtype = WCAS_init.CMAQsimtype
         self.WCAS_dir = WCAS_init.WCAS_dir
         self.gridname = WCAS_init.gridname
-        self.regrid_dom = WCAS_init.regrid_dom
+        self.regrid_dom = WCAS_RunMCIP.regrid_dom
         self.CMAQ_dir = WCAS_init.CMAQ_dir
         self.WRF_dir = WCAS_init.WRF_dir
         self.compiler_str = WCAS_init.compiler_str
@@ -1916,6 +2021,7 @@ class WCAS_RunICON():
     def run_profile(self):
         print(Now() + ' - ' +f'    开始运行ICON - d0{str(self.regrid_dom)}')
         os.chdir(f"{self.WCAS_dir}")
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_profile_d0{self.regrid_dom}.ok"
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','APPL',self.ICON_APPL)
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','ICTYPE','profile')
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','GRID_NAME',self.MCIP_GridName)
@@ -1923,18 +2029,22 @@ class WCAS_RunICON():
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','DATE',self.start_date_MCIP)
         os.chdir(f"{self.CMAQ_dir}PREP/icon/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh {self.CMAQ_dir}PREP/icon/scripts/run_icon_daybyday_profile_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_profile.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_icon_daybyday_profile_WCAS.csh")
             if len(os.listdir(f"{self.CMAQdata_dir}{self.MCIP_GridName}/icon")) < 1: # 文件生成数量是否正常
                 print(Now() + ' - '+' 错误! ICON结果未能正常输出，请检查参数输入是否正确')
                 sys.exit() 
         print(Now() + ' - ' +'    ICON运行完成！')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_profile.ok")
+        ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/icon", 1, "ICON")
+        execute_command(f"touch {flag_file}")
 
     def run_regrid(self,targetdom,predomain=False):
         print(Now() + ' - ' +'    开始运行ICON - d0'+str(targetdom))
         os.chdir(f"{self.WCAS_dir}")
         if predomain != False: self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' # 当进行连续regrid模拟时 根据前一层的结果进行domain
+        self.regrid_dom = targetdom
+        self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
+        self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' if predomain != False else self.gridname + '_d01'
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','APPL',self.ICON_APPL)
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','ICTYPE',self.CMAQsimtype) # 
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','GRID_NAME',self.MCIP_GridName)
@@ -1949,6 +2059,7 @@ class WCAS_RunICON():
             print(Now() + ' - '+' 错误! ICON结果未能正常输出，请检查参数输入是否正确')
            # sys.exit() 
         print(Now() + ' - ' +'    ICON运行完成！')
+        ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/icon", 1, "ICON")
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_regrid_d0{targetdom}.ok") 
 class WCAS_RunPreMEGAN():
     
@@ -2059,6 +2170,7 @@ class WCAS_RunMEIAT():
         self.resd01 = WCAS_CalcuWRFGrid.resd01
         self.resd02 = WCAS_CalcuWRFGrid.resd02
         self.resd03 = WCAS_CalcuWRFGrid.resd03
+        self.domres_by_targetdom = {1: self.resd01, 2: self.resd02, 3: self.resd03}
         if self.regrid_dom == 1: self.domres = self.resd01
         if self.regrid_dom == 2: self.domres = self.resd02
         if self.regrid_dom == 3: self.domres = self.resd03
@@ -2072,6 +2184,7 @@ class WCAS_RunMEIAT():
 
     def run(self,targetdom):
         self.MCIP_GridName = self.gridname + '_d0'+str(targetdom)
+        self.domres = self.domres_by_targetdom[targetdom]
         execute_command(f"mkdir {self.CMAQdata_dir}{self.MCIP_GridName}/emis") # 创建排放清单文件夹
         if self.MEIAT_Linux == False: # Win下运行的带有arcgispro进行空间分配的MEIAT，还是直接在Linux调用仅平均分配的MEIAT
             print(Now() + ' - ' +f'    开始主机调用MEIAT生成MEIC人为源排放清单 - d0{targetdom}')
@@ -2135,7 +2248,7 @@ class WCAS_RunCCTM():
         self.CMAQsimtype = WCAS_init.CMAQsimtype
         self.WCAS_dir = WCAS_init.WCAS_dir
         self.gridname = WCAS_init.gridname
-        self.regrid_dom = WCAS_init.regrid_dom
+        self.regrid_dom = WCAS_RunMCIP.regrid_dom
         self.CMAQ_dir = WCAS_init.CMAQ_dir
         self.WRF_dir = WCAS_init.WRF_dir
         self.compiler_str = WCAS_init.compiler_str
@@ -2158,6 +2271,13 @@ class WCAS_RunCCTM():
         self.MCIP_GridName = WCAS_RunMCIP.MCIP_GridName
 
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
+
+    def verify_cctm_outputs(self, require_conc=True):
+        cctm_dir = f"{self.CMAQdata_dir}{self.MCIP_GridName}/cctm"
+        expected_days = len(getDatesByTimes(self.cctm_start_date, self.cctm_end_date))
+        ensure_min_files(cctm_dir, expected_days, "CCTM ACONC", prefix="CCTM_ACONC")
+        if require_conc:
+            ensure_min_files(cctm_dir, expected_days, "CCTM CONC", prefix="CCTM_CONC")
 
     
     def run_profile(self,regridALLCONC=False):
@@ -2207,14 +2327,18 @@ class WCAS_RunCCTM():
             print(Now() + ' - ' +'    ISAM预处理过程完成')
         os.chdir(f"{self.CMAQ_dir}/CCTM/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_cctm_daybyday_profile_WCAS.csh {self.CMAQ_dir}CCTM/scripts/")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_profile.ok") == False:
-            execute_command(f"sbatch run_cctm_daybyday_profile_WCAS.csh")
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_profile_d0{self.regrid_dom}.ok"
+        if os.path.exists(flag_file) == False:
+            run_sbatch_and_wait("run_cctm_daybyday_profile_WCAS.csh", done_file=f"{self.CMAQ_dir}/CCTM/scripts/cctmcsh.ok")
         print(Now() + ' - ' +'    CCTM运行完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_profile.ok")
+        self.verify_cctm_outputs(require_conc=True)
+        execute_command(f"touch {flag_file}")
     
     def run_regrid(self,targetdom,regridALLCONC=False):
         print(Now() + ' - ' +'    开始运行CCTM - d0'+str(targetdom))
         os.chdir(f"{self.WCAS_dir}")
+        self.regrid_dom = targetdom
+        self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh','VRSN',F"v{self.CCTMversion}")
         CMAQ_exe = F"CCTM_v{self.CCTMversion}.exe"
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh','APPL',self.ICON_APPL)
@@ -2258,8 +2382,9 @@ class WCAS_RunCCTM():
         os.chdir(f"{self.CMAQ_dir}/CCTM/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh {self.CMAQ_dir}CCTM/scripts/")
         if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_regrid_d0{targetdom}.ok") == False:
-            execute_command(f"sbatch run_cctm_daybyday_regrid_WCAS.csh")
+            run_sbatch_and_wait("run_cctm_daybyday_regrid_WCAS.csh", done_file=f"{self.CMAQ_dir}/CCTM/scripts/cctmcsh.ok")
         print(Now() + ' - ' +'    CCTM运行完成')
+        self.verify_cctm_outputs(require_conc=True)
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_regrid_d0{targetdom}.ok")
 class WCAS_RunCombine():
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP):
@@ -2273,6 +2398,7 @@ class WCAS_RunCombine():
         self.CCTMversion = WCAS_init.CCTMversion
         self.CMAQcombine = WCAS_init.CMAQcombine
         self.regrid_D02andD03 = WCAS_init.regrid_D02andD03
+        self.max_dom_manual = WCAS_init.max_dom_manual
         self.WRF_dir = WCAS_init.WRF_dir
         
         self.cores_CMAQ_col = WCAS_init.cores_CMAQ_col
@@ -2335,24 +2461,32 @@ class WCAS_RunCombine():
             self.combineDomain(targetdom=self.regrid_dom)
         else:
             self.combineDomain(targetdom=2) # 暂时默认三层模拟
-            self.combineDomain(targetdom=3)
+            if self.max_dom_manual >= 3:
+                self.combineDomain(targetdom=3)
         print(Now() + ' - ' + f'CMAQ结果Combine完成')
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok")
 
     def run_profile(self):
-        self.combineDomain(targetdom=1)
+        self.combineDomain(targetdom=self.regrid_dom)
         print(Now() + ' - ' + f'CMAQ结果Combine完成')
         execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok")
 
     def move_WRFoutput(self): # 整理WRFoutput到WCAS的目录
-        os.chdir(f"{self.WRF_dir}run/WRFoutput")
-        execute_command(f"mkdir d01") 
-        execute_command(f"mkdir d02") 
-        execute_command(f"mkdir d03") 
+        source_dir = f"{self.WRF_dir}run/WRFoutput"
+        target_dir = f"{self.WCAS_dir}simulations/{self.gridname}/WRFoutput"
+        if not os.path.exists(source_dir):
+            if os.path.exists(target_dir):
+                print(Now() + ' - ' + f'WRFoutput already archived: {target_dir}')
+                return
+            raise RuntimeError(f"WRFoutput directory does not exist: {source_dir}")
+        if os.path.exists(target_dir):
+            raise RuntimeError(f"Target WRFoutput directory already exists: {target_dir}")
+        os.chdir(source_dir)
+        for dom in ["d01", "d02", "d03"]:
+            execute_command(f"mkdir -p {dom}")
+            if any(f.startswith(f"wrfout_{dom}") for f in os.listdir(".")):
+                execute_command(f"mv wrfout_{dom}* {dom}")
         time.sleep(1.5)
-        execute_command(f"mv wrfout_d01* d01") 
-        execute_command(f"mv wrfout_d02* d02") 
-        execute_command(f"mv wrfout_d03* d03") 
         execute_command(f"rm -rf wrfrst*") # 模拟完成，删除rst文件和bdy文件
         execute_command(f"rm -rf wrfinput*") # 模拟完成，删除rst文件和bdy文件
         time.sleep(4)
@@ -2393,10 +2527,10 @@ if __name__ == "__main__":
             WCAS_RunMEIAT.run(targetdom=WCAS_init.regrid_dom)
             WCAS_RunCCTM = WCAS_RunCCTM(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP)
             WCAS_RunCCTM.run_profile()
-            sys.exit()
             WCAS_RunCombine = WCAS_RunCombine(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP)
-            WCAS_RunCombine.run_profile()
-            WCAS_RunCombine.move_WRFoutput()
+            if WCAS_init.runPostprocess == True:
+                WCAS_RunCombine.run_profile()
+                WCAS_RunCombine.move_WRFoutput()
         if WCAS_init.CMAQsimtype == 'regrid':
             WCAS_RunMCIP = WCAS_RunMCIP(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid)
             WCAS_RunMCIP.run(regrid_dom=1)
@@ -2423,14 +2557,15 @@ if __name__ == "__main__":
                 WCAS_RunMEIAT.run(targetdom=2)
                 WCAS_RunCCTM.run_regrid(targetdom=2,regridALLCONC=True)
 
-                WCAS_RunMCIP.run(regrid_dom=3)
-                WCAS_RunBCON.run_regrid(targetdom=3,predomain=2)
-                WCAS_RunICON.run_regrid(targetdom=3,predomain=2)
-                if WCAS_init.runMEGAN == True:
-                    WCAS_RunPreMEGAN.run(targetdom=3)
-                    WCAS_RunMegan.run(targetdom=3)
-                WCAS_RunMEIAT.run(targetdom=3)
-                WCAS_RunCCTM.run_regrid(targetdom=3)
+                if WCAS_init.max_dom_manual >= 3:
+                    WCAS_RunMCIP.run(regrid_dom=3)
+                    WCAS_RunBCON.run_regrid(targetdom=3,predomain=2)
+                    WCAS_RunICON.run_regrid(targetdom=3,predomain=2)
+                    if WCAS_init.runMEGAN == True:
+                        WCAS_RunPreMEGAN.run(targetdom=3)
+                        WCAS_RunMegan.run(targetdom=3)
+                    WCAS_RunMEIAT.run(targetdom=3)
+                    WCAS_RunCCTM.run_regrid(targetdom=3)
             else:
                 WCAS_RunMCIP.run(regrid_dom=WCAS_init.regrid_dom) # 同时决定了MEGAN MEIAT的排放目标dom
                 WCAS_RunBCON.run_regrid(targetdom=WCAS_init.regrid_dom)
@@ -2442,8 +2577,9 @@ if __name__ == "__main__":
                 WCAS_RunCCTM.run_regrid(targetdom=WCAS_init.regrid_dom)
 
             WCAS_RunCombine = WCAS_RunCombine(WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP)
-            WCAS_RunCombine.run()
-            WCAS_RunCombine.move_WRFoutput()
+            if WCAS_init.runPostprocess == True:
+                WCAS_RunCombine.run()
+                WCAS_RunCombine.move_WRFoutput()
 
     print(Now() + ' - ' +f'WCAS运行完成 模拟过程名: {WCAS_init.gridname} 运行耗时: {time.time() - WCAS_init.WCAS_start_time}')
     execute_command(f"touch {WCAS_init.WCAS_dir}simulations/{WCAS_init.gridname}/flagfiles/WCAS.ok")
