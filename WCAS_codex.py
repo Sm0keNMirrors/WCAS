@@ -1897,9 +1897,32 @@ class WCAS_RunWRF():
         if self.ScNet_env == True:
             self.WPS_WRF_env = WCAS_init.WPS_WRF_env
 
+    def copy_wrfoutput_to_simulation(self, replace_existing=False):
+        source_dir = f"{self.WRF_dir}run/WRFoutput"
+        target_dir = f"{self.WCAS_dir}simulations/{self.gridname}/WRFoutput"
+        temp_dir = f"{target_dir}.copying"
+        if not os.path.isdir(source_dir):
+            if os.path.isdir(target_dir):
+                print(Now() + ' - ' + f'WRFoutput already copied to: {target_dir}')
+                return
+            print(Now() + ' - ' + f'WRFoutput source does not exist, skip copy: {source_dir}')
+            return
+        if os.path.exists(target_dir) and not replace_existing:
+            print(Now() + ' - ' + f'WRFoutput already copied to: {target_dir}')
+            return
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        print(Now() + ' - ' + f'复制WRFoutput到: {target_dir}')
+        shutil.copytree(source_dir, temp_dir)
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        shutil.move(temp_dir, target_dir)
+        print(Now() + ' - ' + 'WRFoutput复制完成')
+
     def run(self):
         flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok"
         if flag_exists(flag_file, "WRF"):
+            self.copy_wrfoutput_to_simulation(replace_existing=False)
             return
         print(Now() + ' - '+'将模拟时间段和嵌套范围数据写入namelist.input')
         namelist_input = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.input.temp")
@@ -1951,6 +1974,7 @@ class WCAS_RunWRF():
                 sys.exit()
         # ========================================WRF======================================== 注释此部分可跳过,用于调试
         print(Now() + ' - '+'WRF运行完成！')
+        self.copy_wrfoutput_to_simulation(replace_existing=True)
         execute_command(f"touch {flag_file}")
         
     def modify_ntasks_per_node(self,filename, new_value, output_filename=None):
@@ -2005,6 +2029,26 @@ class WCAS_RunMCIP():
 
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
 
+    def resolve_wrf_met_dir(self, regrid_dom):
+        domain_prefix = f"wrfout_d0{regrid_dom}_"
+        expected_start_file = f"{domain_prefix}{self.start_date_MCIP}_00:00:00"
+        archived_wrf_output_dir = f"{self.CMAQdata_dir}WRFoutput"
+        wrf_run_output_dir = f"{self.WRF_dir}run/WRFoutput"
+        candidates = [archived_wrf_output_dir, wrf_run_output_dir]
+        for candidate in candidates:
+            if not os.path.isdir(candidate):
+                continue
+            if os.path.exists(os.path.join(candidate, expected_start_file)):
+                print(Now() + ' - ' + f'MCIP InMetDir = {candidate}')
+                return candidate
+            if glob.glob(os.path.join(candidate, f"{domain_prefix}*")):
+                print(Now() + ' - ' + f'MCIP InMetDir = {candidate}')
+                return candidate
+        raise RuntimeError(
+            f"Cannot find WRF output for MCIP d0{regrid_dom}. "
+            f"Checked: {archived_wrf_output_dir}, {wrf_run_output_dir}"
+        )
+
     def run(self,regrid_dom):
         self.regrid_dom = regrid_dom # profile从d01开始，也可能直接profile目标dom
         print(Now() + ' - ' + f'开始准备CMAQ的模拟 - 模拟方式 - {self.CMAQsimtype}')
@@ -2020,10 +2064,7 @@ class WCAS_RunMCIP():
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','domain',self.regrid_dom) # 最里层dom
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','GridName',self.MCIP_GridName)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','DataPath',self.CMAQdata_dir)
-        wrf_output_dir = f"{self.WRF_dir}run/WRFoutput"
-        archived_wrf_output_dir = f"{self.CMAQdata_dir}WRFoutput"
-        if not os.path.exists(wrf_output_dir) and os.path.exists(archived_wrf_output_dir):
-            wrf_output_dir = archived_wrf_output_dir
+        wrf_output_dir = self.resolve_wrf_met_dir(self.regrid_dom)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','InMetDir',wrf_output_dir)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','InGeoDir',f"{self.WCAS_dir}simulations/{self.gridname}/WPSoutput")
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','WRF_LC_REF_LAT',self.ref_lat)
@@ -2628,25 +2669,16 @@ class WCAS_RunCombine():
             return
         source_dir = f"{self.WRF_dir}run/WRFoutput"
         target_dir = f"{self.WCAS_dir}simulations/{self.gridname}/WRFoutput"
-        if not os.path.exists(source_dir):
-            if os.path.exists(target_dir):
-                print(Now() + ' - ' + f'WRFoutput already archived: {target_dir}')
-                return
-            raise RuntimeError(f"WRFoutput directory does not exist: {source_dir}")
         if os.path.exists(target_dir):
-            raise RuntimeError(f"Target WRFoutput directory already exists: {target_dir}")
+            print(Now() + ' - ' + f'WRFoutput already archived: {target_dir}')
+            return
+        if not os.path.exists(source_dir):
+            raise RuntimeError(f"WRFoutput directory does not exist: {source_dir}")
         os.chdir(source_dir)
-        for dom in ["d01", "d02", "d03"]:
-            execute_command(f"mkdir -p {dom}")
-            if any(f.startswith(f"wrfout_{dom}") for f in os.listdir(".")):
-                execute_command(f"mv wrfout_{dom}* {dom}")
-        time.sleep(1.5)
         execute_command(f"rm -rf wrfrst*") # 模拟完成，删除rst文件和bdy文件
         execute_command(f"rm -rf wrfinput*") # 模拟完成，删除rst文件和bdy文件
-        time.sleep(4)
         os.chdir(f"{self.WRF_dir}run")
         execute_command(f"mv WRFoutput {self.WCAS_dir}simulations/{self.gridname}/") 
-        time.sleep(5)
     
 
 if __name__ == "__main__":
