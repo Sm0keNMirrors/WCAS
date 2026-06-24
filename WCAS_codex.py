@@ -28,6 +28,7 @@ import urllib3
 import requests
 import re
 import paramiko
+import glob
 from tqdm import tqdm
 
 
@@ -990,6 +991,69 @@ def ensure_min_files(dir_path, min_count, process_name, prefix=None):
         raise RuntimeError(f"{process_name} output check failed: {dir_path}, expected >= {min_count}, got {len(files)}")
     return files
 
+def move_meiat_outputs(source_root, target_dir, grid_name):
+    ensure_dir(target_dir)
+    target_existing = glob.glob(os.path.join(target_dir, f"*{grid_name}*.nc"))
+    if target_existing:
+        print(Now() + ' - ' + f'MEIAT outputs already exist in {target_dir}, skip moving')
+        return target_existing
+
+    exact_dir = os.path.join(source_root, f"model_emission_{grid_name}")
+    candidate_dirs = []
+    if os.path.isdir(exact_dir):
+        candidate_dirs.append(exact_dir)
+    candidate_dirs.extend(d for d in glob.glob(os.path.join(source_root, "model_emission*")) if os.path.isdir(d) and d not in candidate_dirs)
+    if os.path.isdir(os.path.join(source_root, "output")):
+        candidate_dirs.append(os.path.join(source_root, "output"))
+    candidate_dirs.append(source_root)
+
+    patterns = [f"*_*_{grid_name}_*.nc", f"*{grid_name}*.nc", "*.nc"]
+    matches = []
+    for candidate_dir in candidate_dirs:
+        for pattern in patterns:
+            matches.extend(glob.glob(os.path.join(candidate_dir, pattern)))
+        if matches:
+            break
+    matches = sorted(set(matches))
+    if not matches:
+        available_dirs = [os.path.basename(d.rstrip(os.sep)) for d in glob.glob(os.path.join(source_root, "*")) if os.path.isdir(d)]
+        raise RuntimeError(
+            f"MEIAT_Linux did not create nc outputs for {grid_name}. "
+            f"Expected under {exact_dir}; searched {candidate_dirs}; "
+            f"available output dirs: {available_dirs}"
+        )
+
+    moved_files = []
+    for src in matches:
+        dst = os.path.join(target_dir, os.path.basename(src))
+        if os.path.abspath(src) == os.path.abspath(dst):
+            moved_files.append(dst)
+            continue
+        if os.path.exists(dst):
+            moved_files.append(dst)
+            continue
+        shutil.move(src, dst)
+        moved_files.append(dst)
+    return moved_files
+
+def get_domain_griddesc_path(CMAQdata_dir, grid_name):
+    griddesc_path = os.path.join(CMAQdata_dir, grid_name, "mcip", "GRIDDESC")
+    if not os.path.exists(griddesc_path):
+        raise RuntimeError(f"GRIDDESC for {grid_name} does not exist: {griddesc_path}")
+    with open(griddesc_path, 'r', encoding='utf-8', errors='ignore') as file:
+        content = file.read()
+    if grid_name not in content:
+        raise RuntimeError(f"GRIDDESC does not contain grid name {grid_name}: {griddesc_path}")
+    return griddesc_path
+
+def copy_domain_griddesc(CMAQdata_dir, grid_name, target_dir):
+    src = get_domain_griddesc_path(CMAQdata_dir, grid_name)
+    ensure_dir(target_dir)
+    dst = os.path.join(target_dir, "GRIDDESC")
+    shutil.copy2(src, dst)
+    print(Now() + ' - ' + f'Copied {grid_name} GRIDDESC to {dst}')
+    return dst
+
 def scalar_nml(value, name):
     if isinstance(value, (list, tuple)):
         if len(value) == 0:
@@ -1025,10 +1089,21 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
 
+def trailing_slash(path):
+    if path is None or str(path) == '':
+        return ''
+    return str(path).rstrip('/') + '/'
+
 def ensure_simulation_dirs(WCAS_dir, gridname):
     simulation_dir = ensure_dir(f"{WCAS_dir}simulations/{gridname}")
     flag_dir = ensure_dir(f"{simulation_dir}/flagfiles")
     return simulation_dir, flag_dir
+
+def flag_exists(flag_file, process_name):
+    if os.path.exists(flag_file):
+        print(Now() + ' - ' + f'{process_name}.ok exists, skip this process')
+        return True
+    return False
 
 def build_lon_lat_limit(namelist_WCAS, max_dom):
     lon_lat_limit = {}
@@ -1441,6 +1516,13 @@ class WCAS_GetReanalysis():
     
     def downloadFNLGFS(self):
         print(Now() + ' - 下载FNL/GFS再分析资料')
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Reanalysis.ok"
+        if flag_exists(flag_file, "Reanalysis"):
+            self.GFS = 0
+            fnl_dir = f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles/'
+            if os.path.exists(fnl_dir):
+                self.GFS = 1 if any(i.split('.')[0] == 'gfs' for i in os.listdir(fnl_dir)) else 0
+            return
         if not os.path.exists(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles/'):
             if self.ForceGFS == True:
                 self.GFS = 1
@@ -1543,10 +1625,14 @@ class WCAS_GetReanalysis():
                     self.GFS = 1
                 else: self.GFS = 0
             print(Now() + ' - 此次模拟的FNL/GFS再分析资料已经下载')
+        execute_command(f"touch {flag_file}")
         
     
     def Getlink(self):
         print(Now() + ' - 整理已有下载FNL/GFS再分析资料')
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Reanalysis.ok"
+        if flag_exists(flag_file, "Reanalysis"):
+            return
         if not os.path.exists(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles/'):
             ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}')
             ensure_dir(f'{self.WCAS_dir}simulations/{self.gridname}/fnlfiles')
@@ -1558,6 +1644,7 @@ class WCAS_GetReanalysis():
             print(Now() + ' - 此次模拟的FNL/GFS再分析资料整理完成')
         else:
             print(Now() + ' - 此次模拟的FNL/GFS再分析资料已经整理')
+        execute_command(f"touch {flag_file}")
 class WCAS_CalcuWRFGrid():
 
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_GetReanalysis):
@@ -1582,6 +1669,8 @@ class WCAS_CalcuWRFGrid():
 
     def run(self):
         print(Now() + ' - 计算嵌套区域数据')
+        wps_flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok"
+        wps_done = os.path.exists(wps_flag_file)
         if self.ManualGrid == False: # 基于经纬度计算grid模式：
             res_d01 = scalar_number_nml(self.namelist_WCAS['grid']['res_d01'], 'grid.res_d01')
             grid_dict = wrf_grid_calculate(lon_lat_limit=build_lon_lat_limit(self.namelist_WCAS, self.max_dom_manual),
@@ -1607,11 +1696,13 @@ class WCAS_CalcuWRFGrid():
             self.resd01 = scalar_number_nml(self.namelist_WCAS['manualgrid']['dx'], 'manualgrid.dx')
             self.resd02 = self.resd01 /3
             self.resd03 = self.resd01 /3 /3
-        with open(f'{self.WCAS_dir}simulations/{self.gridname}/geogridinfo.txt', 'w') as file:
-            print(grid_dict, file=file)
+        if not wps_done:
+            with open(f'{self.WCAS_dir}simulations/{self.gridname}/geogridinfo.txt', 'w') as file:
+                print(grid_dict, file=file)
         print(Now() + ' - wrf_lambert_grid_caculating计算完成')    
 
-        print(Now() + ' - 将模拟时间段和嵌套范围数据写入namelist.wps')
+        if not wps_done:
+            print(Now() + ' - 将模拟时间段和嵌套范围数据写入namelist.wps')
         for key in ['e_we', 'e_sn', 'i_start', 'j_start']:
             if len(grid_dict[key]) < self.max_dom_manual:
                 raise ValueError(f"{key} has {len(grid_dict[key])} values, but max_dom is {self.max_dom_manual}")
@@ -1637,6 +1728,10 @@ class WCAS_CalcuWRFGrid():
         
 
         
+        if wps_done:
+            print(Now() + ' - WPS.ok exists, skip geogridinfo.txt and namelist.wps update')
+            return
+
         namelist_wps = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.wps.temp") #
         hour = '_00:00:00'  # 暂时未考虑非0时时段
         namelist_wps['share']['max_dom'] = self.max_dom_manual
@@ -1694,7 +1789,10 @@ class WCAS_RunWPS():
 
     def run(self):
         print(Now() + ' - 开始运行WPS')
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok") == False:
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok"
+        if flag_exists(flag_file, "WPS"):
+            return
+        if os.path.exists(flag_file) == False:
             print(Now() + ' - 删除WPS与WRF的历史临时文件...')
             # terminal_exec(terminal, f"cd {WPS_dir}")
             os.chdir(f"{self.WPS_dir}")
@@ -1755,7 +1853,7 @@ class WCAS_RunWPS():
             print(Now() + ' - ' + '    metgrid.exe运行完成')
 
         print(Now() + ' - ' + 'WPS运行完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/WPS.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunWRF():
 
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_GetReanalysis,WCAS_CalcuWRFGrid):
@@ -1800,6 +1898,9 @@ class WCAS_RunWRF():
             self.WPS_WRF_env = WCAS_init.WPS_WRF_env
 
     def run(self):
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok"
+        if flag_exists(flag_file, "WRF"):
+            return
         print(Now() + ' - '+'将模拟时间段和嵌套范围数据写入namelist.input')
         namelist_input = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.input.temp")
         run_days = (datetime.datetime.strptime(self.end_date_WRF, '%Y-%m-%d') - datetime.datetime.strptime(self.start_date_WRF, '%Y-%m-%d')).days
@@ -1830,7 +1931,7 @@ class WCAS_RunWRF():
         execute_command("ulimit -c unlimited")
         # ========================================WRF======================================== 注释此部分可跳过,用于调试
         
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./real.exe")
             if self.ScNet_env == True: # 曙光服务器环境sbatch提交运行
                 self.modify_ntasks_per_node('wrf.slurm',self.cores_WRF)
@@ -1850,7 +1951,7 @@ class WCAS_RunWRF():
                 sys.exit()
         # ========================================WRF======================================== 注释此部分可跳过,用于调试
         print(Now() + ' - '+'WRF运行完成！')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/WRF.ok")
+        execute_command(f"touch {flag_file}")
         
     def modify_ntasks_per_node(self,filename, new_value, output_filename=None):
         """
@@ -1909,6 +2010,9 @@ class WCAS_RunMCIP():
         print(Now() + ' - ' + f'开始准备CMAQ的模拟 - 模拟方式 - {self.CMAQsimtype}')
         print(Now() + ' - ' +f'    开始运行MCIP - d{self.regrid_dom}')
         self.MCIP_GridName = self.gridname + '_d0'+str(self.regrid_dom)
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MCIP_d0{regrid_dom}.ok"
+        if flag_exists(flag_file, f"MCIP_d0{regrid_dom}"):
+            return
         os.chdir(f"{self.WCAS_dir}")
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','CMAQ_HOME',self.CMAQ_dir)
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','start_time',self.start_date_MCIP)
@@ -1925,13 +2029,13 @@ class WCAS_RunMCIP():
         modify_csh_variable('namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh','WRF_LC_REF_LAT',self.ref_lat)
         os.chdir(f"{self.CMAQ_dir}PREP/mcip/scripts/") #
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_mcip_daybyday_profile_WCAS.csh {self.CMAQ_dir}PREP/mcip/scripts/run_mcip_daybyday_profile_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MCIP_d0{regrid_dom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command(f"./run_mcip_daybyday_profile_WCAS.csh {self.compiler_str}")
             if len(os.listdir(f"{self.CMAQdata_dir}{self.MCIP_GridName}/mcip")) < 2+self.run_days_MCIP*9 and os.path.exists(f"{self.CMAQdata_dir}{self.MCIP_GridName}/mcip") == True: # 文件生成数量是否正常(2个单独的和9类)，第二个条件是防止找不到路径报错
                 print(Now() + ' - '+' 错误! MCIP结果未能正常输出，请检查参数输入是否正确')
                 sys.exit() 
         print(Now() + ' - ' +'    MCIP运行完成！')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/MCIP_d0{regrid_dom}.ok")
+        execute_command(f"touch {flag_file}")
         execute_command(f"cp {self.CMAQdata_dir}{self.MCIP_GridName}/mcip/GRIDDESC {self.WCAS_dir}simulations/{self.gridname}/GRIDDESC") # 转移GRIDDESC到上级目录
 class WCAS_RunBCON():
 
@@ -1958,6 +2062,8 @@ class WCAS_RunBCON():
         print(Now() + ' - ' +f'    开始运行BCON - d0{str(self.regrid_dom)}')
         os.chdir(f"{self.WCAS_dir}")
         flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_profile_d0{self.regrid_dom}.ok"
+        if flag_exists(flag_file, f"BCON_profile_d0{self.regrid_dom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','BCTYPE','profile')
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','start_time',self.start_date_MCIP)
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_profile_WCAS.csh','end_time',self.end_date_MCIP)
@@ -1981,6 +2087,9 @@ class WCAS_RunBCON():
         self.regrid_dom = targetdom
         self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
         self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' if predomain != False else self.gridname + '_d01'
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_regrid_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"BCON_regrid_d0{targetdom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','BCTYPE',self.CMAQsimtype) # d01
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','start_time',self.start_date_MCIP)
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','end_time',self.end_date_MCIP)
@@ -1990,14 +2099,14 @@ class WCAS_RunBCON():
         modify_csh_variable('namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh','APPL',self.ICON_APPL)
         os.chdir(f"{self.CMAQ_dir}PREP/bcon/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_bcon_daybyday_regrid_WCAS.csh {self.CMAQ_dir}PREP/bcon/scripts/run_bcon_daybyday_regrid_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_regrid_d0{targetdom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_bcon_daybyday_regrid_WCAS.csh")
         if len(os.listdir(f"{self.CMAQdata_dir}{self.MCIP_GridName}/bcon")) < self.run_days_MCIP*1: # 文件生成数量是否正常
             print(Now() + ' - '+' 错误! BCON结果未能正常输出，请检查参数输入是否正确')
            # sys.exit() 
         print(Now() + ' - ' +'    BCON运行完成！')
         ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/bcon", self.run_days_MCIP, "BCON")
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/BCON_regrid_d0{targetdom}.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunICON():
     
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_RunMCIP):
@@ -2022,6 +2131,8 @@ class WCAS_RunICON():
         print(Now() + ' - ' +f'    开始运行ICON - d0{str(self.regrid_dom)}')
         os.chdir(f"{self.WCAS_dir}")
         flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_profile_d0{self.regrid_dom}.ok"
+        if flag_exists(flag_file, f"ICON_profile_d0{self.regrid_dom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','APPL',self.ICON_APPL)
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','ICTYPE','profile')
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_profile_WCAS.csh','GRID_NAME',self.MCIP_GridName)
@@ -2045,6 +2156,9 @@ class WCAS_RunICON():
         self.regrid_dom = targetdom
         self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
         self.MCIP_GridName_d01 = self.gridname + f'_d0{predomain}' if predomain != False else self.gridname + '_d01'
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_regrid_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"ICON_regrid_d0{targetdom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','APPL',self.ICON_APPL)
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','ICTYPE',self.CMAQsimtype) # 
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','GRID_NAME',self.MCIP_GridName)
@@ -2053,14 +2167,14 @@ class WCAS_RunICON():
         modify_csh_variable('namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh','DATE',self.start_date_MCIP)
         os.chdir(f"{self.CMAQ_dir}PREP/icon/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_icon_daybyday_regrid_WCAS.csh {self.CMAQ_dir}PREP/icon/scripts/run_icon_daybyday_regrid_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_regrid_d0{targetdom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_icon_daybyday_regrid_WCAS.csh")
         if len(os.listdir(f"{self.CMAQdata_dir}{self.MCIP_GridName}/icon")) < 1: # 文件生成数量是否正常
             print(Now() + ' - '+' 错误! ICON结果未能正常输出，请检查参数输入是否正确')
            # sys.exit() 
         print(Now() + ' - ' +'    ICON运行完成！')
         ensure_min_files(f"{self.CMAQdata_dir}{self.MCIP_GridName}/icon", 1, "ICON")
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/ICON_regrid_d0{targetdom}.ok") 
+        execute_command(f"touch {flag_file}") 
 class WCAS_RunPreMEGAN():
     
     def __init__(self,WCAS_init,WCAS_RunMCIP):
@@ -2077,7 +2191,11 @@ class WCAS_RunPreMEGAN():
 
     def run(self,targetdom):
         print(Now() + ' - ' +f'    开始运行PreMEGAN - d0{targetdom}')
-        GRIDDESC = open(f"{self.WCAS_dir}simulations/{self.gridname}/GRIDDESC")  
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/PreMEGAN_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"PreMEGAN_d0{targetdom}"):
+            return
+        MCIP_GridName = self.gridname + '_d0'+str(targetdom)
+        GRIDDESC = open(get_domain_griddesc_path(f"{self.WCAS_dir}simulations/{self.gridname}/", MCIP_GridName))
         lines = GRIDDESC.readlines()  # 读一次存入，读多次会错误
         rowcolgrid_pre = lines[5].split(' ')  # 读取namelist相应行的数据
         rowcolgrid = []
@@ -2097,10 +2215,10 @@ class WCAS_RunPreMEGAN():
         namelist_premegan.write(f"{self.premegan_dir}prepmegan4cmaq.inp", force=True)
         os.chdir(f"{self.premegan_dir}")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_prepmegan4cmaq_WCAS.csh {self.premegan_dir}run_prepmegan4cmaq_WCAS.csh")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/PreMEGAN_d0{targetdom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_prepmegan4cmaq_WCAS.csh")
         print(Now() + ' - ' +'    PreMEGAN运行完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/PreMEGAN_d0{targetdom}.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunMegan():
     
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_RunMCIP):
@@ -2123,6 +2241,9 @@ class WCAS_RunMegan():
 
     def run(self,targetdom):
         self.MCIP_GridName = self.gridname + '_d0'+str(targetdom)
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEGAN_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"MEGAN_d0{targetdom}"):
+            return
         execute_command(f"mkdir {self.CMAQdata_dir}{self.MCIP_GridName}/emis") # 创建排放清单文件夹
         print(Now() + ' - ' +f'    开始运行MEGAN - d0{targetdom}')
         os.chdir(f"{self.WCAS_dir}")
@@ -2138,7 +2259,7 @@ class WCAS_RunMegan():
         os.chdir(f"{self.MEGAN_dir}")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_megan_WCAS.csh {self.MEGAN_dir}run_megan_WCAS.csh")
         # # ========================================MEGAN======================================== 注释此部分可跳过,用于调试
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEGAN_d0{targetdom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             execute_command("./run_megan_WCAS.csh")
             execute_command(f"mv {self.MEGAN_dir}Output/MEGAN210.{self.MCIP_GridName}.*.ncf {self.CMAQdata_dir}{self.MCIP_GridName}/emis/")
             # # ========================================MEGAN======================================== 注释此部分可跳过,用于调试
@@ -2147,12 +2268,12 @@ class WCAS_RunMegan():
                 print(Now() + ' - '+' 错误! MEGAN生物源清单未能正常输出，请检查参数输入是否正确')
                 sys.exit() 
         print(Now() + ' - ' +'    MEGAN运行完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEGAN_d0{targetdom}.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunMEIAT():
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP):
         self.CMAQsimtype = WCAS_init.CMAQsimtype
         self.WCAS_dir = WCAS_init.WCAS_dir
-        self.MEIAT_dir = WCAS_init.MEIAT_dir
+        self.MEIAT_dir = trailing_slash(WCAS_init.MEIAT_dir)
         self.gridname = WCAS_init.gridname
         self.regrid_dom = WCAS_init.regrid_dom
         self.CMAQ_dir = WCAS_init.CMAQ_dir
@@ -2161,7 +2282,7 @@ class WCAS_RunMEIAT():
         self.MEIAT_Linux = WCAS_init.MEIAT_Linux
         self.cores_win = WCAS_init.cores_win
         self.MEIAT_python_dir = WCAS_init.MEIAT_python_dir
-        self.MEIAT_Linux_dir = WCAS_init.MEIAT_Linux_dir
+        self.MEIAT_Linux_dir = trailing_slash(WCAS_init.MEIAT_Linux_dir)
 
         self.start_date_MCIP = WCAS_datetimeInit.start_date_MCIP
         self.emis_start_date = WCAS_datetimeInit.emis_start_date
@@ -2185,10 +2306,13 @@ class WCAS_RunMEIAT():
     def run(self,targetdom):
         self.MCIP_GridName = self.gridname + '_d0'+str(targetdom)
         self.domres = self.domres_by_targetdom[targetdom]
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEIAT_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"MEIAT_d0{targetdom}"):
+            return
         execute_command(f"mkdir {self.CMAQdata_dir}{self.MCIP_GridName}/emis") # 创建排放清单文件夹
         if self.MEIAT_Linux == False: # Win下运行的带有arcgispro进行空间分配的MEIAT，还是直接在Linux调用仅平均分配的MEIAT
             print(Now() + ' - ' +f'    开始主机调用MEIAT生成MEIC人为源排放清单 - d0{targetdom}')
-            execute_command(f"cp {self.WCAS_dir}simulations/{self.gridname}/GRIDDESC {self.MEIAT_dir}input/") # 传递GRIDDESC
+            copy_domain_griddesc(self.CMAQdata_dir, self.MCIP_GridName, f"{self.MEIAT_dir}input/")
             time.sleep(0.2)
             namelist_MEIAT = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.MEIAT.temp")
             namelist_MEIAT['global']['griddesc_name'] = [self.MCIP_GridName]
@@ -2197,7 +2321,7 @@ class WCAS_RunMEIAT():
             namelist_MEIAT['global']['cores'] = [self.cores_win]
             namelist_MEIAT.write(f"{self.MEIAT_dir}namelist.input", force=True)
             os.chdir(f"{self.MEIAT_dir}") # 进入MEIAT并执行排放清单计算
-            if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEIAT_d0{targetdom}.ok") == False:
+            if os.path.exists(flag_file) == False:
                 if os.path.exists(f"{self.MEIAT_dir}output/factor") == True: # 初始化MEIAT
                     execute_command(f"rm -r {self.MEIAT_dir}output/factor") 
                     execute_command(f"rm -r {self.MEIAT_dir}output/zoning_statistics")
@@ -2207,7 +2331,11 @@ class WCAS_RunMEIAT():
                     execute_command(f"cmd.exe /c {self.MEIAT_python_dir} ./fine_emission_2_coarse_emission.py")  # 模拟外层MEIAT只需要运行这一个程序
                     execute_command(f"mmv {self.MEIAT_dir}output/'*_CB06_*.nc' {self.MEIAT_dir}output/'CB06_#2_#1.nc'") #MEIAT命名规范统一
                     time.sleep(3) # 移动，复制等操作后需要等待时间，否则会在未完成复制移动后进行检测
-                    execute_command(f"mv {self.MEIAT_dir}output/*_*_{self.MCIP_GridName}_*.nc {self.CMAQdata_dir}{self.MCIP_GridName}/emis/") # 移动生成的人为源排放清单
+                    move_meiat_outputs(
+                        source_root=self.MEIAT_dir,
+                        target_dir=f"{self.CMAQdata_dir}{self.MCIP_GridName}/emis/",
+                        grid_name=self.MCIP_GridName
+                    )
                     time.sleep(4) # 移动，复制等操作后需要等待时间，否则会在未完成复制移动后进行检测
                 else:
                     execute_command(f"rm -f coarse_emission_2_fine_emission.OK") # 删除flag文件
@@ -2215,12 +2343,16 @@ class WCAS_RunMEIAT():
                     execute_command(f"cmd.exe /c {self.MEIAT_python_dir} ./coarse_emission_2_fine_emission.py") # 不知为何无法继续调用cmd.exe /c python ./Create-CMAQ-Emission-File.py，已经统一到coarse_emission_2_fine_emission中运行
                     execute_command(f"rm -f coarse_emission_2_fine_emission.OK") # 删除flag文件
                     execute_command(f"rm -f Create-CMAQ-Emission-File.OK") # 删除flag文件
-                    execute_command(f"mv {self.MEIAT_dir}output/*_*_{self.MCIP_GridName}_*.nc {self.CMAQdata_dir}{self.MCIP_GridName}/emis/") # 移动生成的人为源排放清单
+                    move_meiat_outputs(
+                        source_root=self.MEIAT_dir,
+                        target_dir=f"{self.CMAQdata_dir}{self.MCIP_GridName}/emis/",
+                        grid_name=self.MCIP_GridName
+                    )
                     time.sleep(5) # 移动，复制等操作后需要等待时间，否则会在未完成复制移动后进行检测
             print(Now() + ' - ' +'    人为源排放清单生成完成')
         else:
             print(Now() + ' - ' +f'    开始调用MEIAT_Linux生成MEIC人为源排放清单 - d0{targetdom}')
-            execute_command(f"cp {self.WCAS_dir}simulations/{self.gridname}/GRIDDESC {self.MEIAT_Linux_dir}input/") # 传递GRIDDESC
+            copy_domain_griddesc(self.CMAQdata_dir, self.MCIP_GridName, f"{self.MEIAT_Linux_dir}input/")
             time.sleep(0.2)
             namelist_MEIAT_Linux = f90nml.read(f"{self.WCAS_dir}namelists_cshfiles/namelist.MEIAT.Linux.temp")
             namelist_MEIAT_Linux['global']['griddesc_name'] = [self.MCIP_GridName]
@@ -2229,20 +2361,20 @@ class WCAS_RunMEIAT():
             namelist_MEIAT_Linux['global']['cores'] = [self.cores_win]
             namelist_MEIAT_Linux.write(f"{self.MEIAT_Linux_dir}namelist.input", force=True)
             os.chdir( f"{self.MEIAT_Linux_dir}") # 进入MEIAT并执行排放清单计算
-            if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEIAT_d0{targetdom}.ok") == False:
+            if os.path.exists(flag_file) == False:
                 if self.ScNet_env == True: # 曙光服务器环境采用slrum方式提交运行
-                    execute_command(F"sbatch MEIAT.slurm")
-                    time.sleep(10) # 提交等待过程
-                    while True:
-                        time.sleep(1)
-                        if not check_squeue_status('MEIAT-CMAQ'):  # 检查提交的任务是否结束
-                            break
+                    run_sbatch_and_wait("MEIAT.slurm")
                 else:
                     execute_command( f"python3 meicmix_f2c.py") 
-                execute_command(f"mv {self.MEIAT_Linux_dir}model_emission_{self.MCIP_GridName}/*_*_{self.MCIP_GridName}_*.nc {self.CMAQdata_dir}{self.MCIP_GridName}/emis/") # 移动生成的人为源排放清单
+                moved_files = move_meiat_outputs(
+                    source_root=self.MEIAT_Linux_dir,
+                    target_dir=f"{self.CMAQdata_dir}{self.MCIP_GridName}/emis/",
+                    grid_name=self.MCIP_GridName
+                )
+                print(Now() + ' - ' + f'    MEIAT_Linux moved {len(moved_files)} emission files')
                 time.sleep(5) # 移动，复制等操作后需要等待时间，否则会在未完成复制移动后进行检测
             print(Now() + ' - ' +'    人为源排放清单生成完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/MEIAT_d0{targetdom}.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunCCTM():
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP):
         self.CMAQsimtype = WCAS_init.CMAQsimtype
@@ -2283,6 +2415,9 @@ class WCAS_RunCCTM():
     def run_profile(self,regridALLCONC=False):
         print(Now() + ' - ' +'    开始运行CCTM profile')
         os.chdir(f"{self.WCAS_dir}")
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_profile_d0{self.regrid_dom}.ok"
+        if flag_exists(flag_file, f"CCTM_profile_d0{self.regrid_dom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_profile_WCAS.csh','VRSN',f"v{self.CCTMversion}")
         CMAQ_exe = f"CCTM_v{self.CCTMversion}.exe"
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_profile_WCAS.csh','APPL',self.ICON_APPL)
@@ -2327,7 +2462,6 @@ class WCAS_RunCCTM():
             print(Now() + ' - ' +'    ISAM预处理过程完成')
         os.chdir(f"{self.CMAQ_dir}/CCTM/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_cctm_daybyday_profile_WCAS.csh {self.CMAQ_dir}CCTM/scripts/")
-        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_profile_d0{self.regrid_dom}.ok"
         if os.path.exists(flag_file) == False:
             run_sbatch_and_wait("run_cctm_daybyday_profile_WCAS.csh", done_file=f"{self.CMAQ_dir}/CCTM/scripts/cctmcsh.ok")
         print(Now() + ' - ' +'    CCTM运行完成')
@@ -2339,6 +2473,9 @@ class WCAS_RunCCTM():
         os.chdir(f"{self.WCAS_dir}")
         self.regrid_dom = targetdom
         self.MCIP_GridName = self.gridname + f'_d0{targetdom}'
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_regrid_d0{targetdom}.ok"
+        if flag_exists(flag_file, f"CCTM_regrid_d0{targetdom}"):
+            return
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh','VRSN',F"v{self.CCTMversion}")
         CMAQ_exe = F"CCTM_v{self.CCTMversion}.exe"
         modify_csh_variable('namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh','APPL',self.ICON_APPL)
@@ -2381,11 +2518,11 @@ class WCAS_RunCCTM():
             time.sleep(3)
         os.chdir(f"{self.CMAQ_dir}/CCTM/scripts")
         execute_command(f"cp {self.WCAS_dir}namelists_cshfiles/run_cctm_daybyday_regrid_WCAS.csh {self.CMAQ_dir}CCTM/scripts/")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_regrid_d0{targetdom}.ok") == False:
+        if os.path.exists(flag_file) == False:
             run_sbatch_and_wait("run_cctm_daybyday_regrid_WCAS.csh", done_file=f"{self.CMAQ_dir}/CCTM/scripts/cctmcsh.ok")
         print(Now() + ' - ' +'    CCTM运行完成')
         self.verify_cctm_outputs(require_conc=True)
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/CCTM_regrid_d0{targetdom}.ok")
+        execute_command(f"touch {flag_file}")
 class WCAS_RunCombine():
     def __init__(self,WCAS_init,WCAS_datetimeInit,WCAS_CalcuWRFGrid,WCAS_RunMCIP):
         self.CMAQsimtype = WCAS_init.CMAQsimtype
@@ -2418,13 +2555,17 @@ class WCAS_RunCombine():
         self.MCIP_GridName = WCAS_RunMCIP.MCIP_GridName
 
         self.CMAQdata_dir = f"{self.WCAS_dir}simulations/{self.gridname}/"
+        self.did_run = False
 
     def combineDomain(self,targetdom):
         print(Now() + ' - ' + f'CombineCMAQ的结果... - d0{targetdom}')
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok"
+        if flag_exists(flag_file, "Post_combine"):
+            return
         MCIP_GridName = self.gridname + f'_d0{str(targetdom)}'
         MCIP_GridName_d01 = self.gridname + '_d01' # D01是必要的结果
         execute_command(f"cp {self.CMAQdata_dir}{MCIP_GridName}/mcip/GRIDDESC {self.WCAS_dir}simulations/{self.gridname}/GRIDDESC")
-        if os.path.exists(f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok") == False:
+        if os.path.exists(flag_file) == False:
             if self.CMAQcombine == False:  # 自己编写的Combine脚本，PM10还不能输出
                 execute_command(f"mkdir {self.CMAQdata_dir}{MCIP_GridName}/cctmCombine") # 整理结果文件
                 os.chdir(f"{self.CMAQdata_dir}{MCIP_GridName}/cctm/")
@@ -2457,6 +2598,11 @@ class WCAS_RunCombine():
         print(Now() + ' - ' + f'CMAQ d0{targetdom} Combine完成') 
     
     def run(self):
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok"
+        self.did_run = False
+        if flag_exists(flag_file, "Post_combine"):
+            return
+        self.did_run = True
         if self.regrid_D02andD03 == False:
             self.combineDomain(targetdom=self.regrid_dom)
         else:
@@ -2464,14 +2610,22 @@ class WCAS_RunCombine():
             if self.max_dom_manual >= 3:
                 self.combineDomain(targetdom=3)
         print(Now() + ' - ' + f'CMAQ结果Combine完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok")
+        execute_command(f"touch {flag_file}")
 
     def run_profile(self):
+        flag_file = f"{self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok"
+        self.did_run = False
+        if flag_exists(flag_file, "Post_combine"):
+            return
+        self.did_run = True
         self.combineDomain(targetdom=self.regrid_dom)
         print(Now() + ' - ' + f'CMAQ结果Combine完成')
-        execute_command(f"touch {self.WCAS_dir}simulations/{self.gridname}/flagfiles/Post_combine.ok")
+        execute_command(f"touch {flag_file}")
 
     def move_WRFoutput(self): # 整理WRFoutput到WCAS的目录
+        if not self.did_run:
+            print(Now() + ' - Post_combine.ok exists, skip moving WRFoutput')
+            return
         source_dir = f"{self.WRF_dir}run/WRFoutput"
         target_dir = f"{self.WCAS_dir}simulations/{self.gridname}/WRFoutput"
         if not os.path.exists(source_dir):
@@ -2498,6 +2652,9 @@ class WCAS_RunCombine():
 if __name__ == "__main__":
 
     WCAS_init = WCAS_init() # WCAS初始化
+    WCAS_flag_file = f"{WCAS_init.WCAS_dir}simulations/{WCAS_init.gridname}/flagfiles/WCAS.ok"
+    if flag_exists(WCAS_flag_file, "WCAS"):
+        sys.exit(0)
     WCAS_datetimeInit = WCAS_datetimeInit(WCAS_init) # 计算获取模式date变量
     WCAS_GetReanalysis = WCAS_GetReanalysis(WCAS_init,WCAS_datetimeInit) # 下载再分析资料
     if WCAS_init.direct_linkreanalysis == False:
@@ -2582,4 +2739,4 @@ if __name__ == "__main__":
                 WCAS_RunCombine.move_WRFoutput()
 
     print(Now() + ' - ' +f'WCAS运行完成 模拟过程名: {WCAS_init.gridname} 运行耗时: {time.time() - WCAS_init.WCAS_start_time}')
-    execute_command(f"touch {WCAS_init.WCAS_dir}simulations/{WCAS_init.gridname}/flagfiles/WCAS.ok")
+    execute_command(f"touch {WCAS_flag_file}")
